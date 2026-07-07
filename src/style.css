@@ -89,3 +89,30 @@ html, body {
   font-size: 13px;
   white-space: pre-wrap;
 }
+
+/* PDFエクスポート(window.print())用。画面表示では常に非表示。 */
+.print-only {
+  display: none;
+}
+
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  .print-only,
+  .print-only * {
+    visibility: visible;
+  }
+  .print-only {
+    display: block;
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    padding: 24px;
+  }
+  .print-only img,
+  .print-only svg {
+    max-width: 100%;
+  }
+}

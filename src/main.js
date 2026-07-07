@@ -136,6 +136,12 @@ function updateStatusBar() {
   statusBar.textContent = dirty ? `${name} *` : name;
 }
 
+// 一時的にステータスバーへメッセージを表示し、しばらくしたら通常表示に戻す
+function flashStatus(message) {
+  statusBar.textContent = message;
+  setTimeout(updateStatusBar, 2500);
+}
+
 function markDirty() {
   dirty = true;
   updateStatusBar();
@@ -159,6 +165,113 @@ function blobToDataUrl(blob) {
 }
 
 let renderDebounceTimer = null;
+
+// ---------------------------------------------------------------
+// HTML / PDF エクスポート
+//
+// プレビュー(preview.innerHTML)は、この時点で既に
+// Markdown -> HTML変換 と Mermaid -> SVG変換が完了した状態なので、
+// それをそのまま書き出しの元にする。
+// 画像はasset://のURLになっているので、エクスポート後もどこでも
+// 見られるようbase64(data:)に変換してから埋め込む。
+// ---------------------------------------------------------------
+
+async function inlineImagesForExport(container) {
+  const imgs = container.querySelectorAll("img");
+  for (const img of imgs) {
+    const src = img.getAttribute("src");
+    if (!src || src.startsWith("data:")) continue;
+    try {
+      const response = await fetch(src);
+      const blob = await response.blob();
+      const dataUrl = await blobToDataUrl(blob);
+      img.setAttribute("src", dataUrl);
+    } catch (err) {
+      // 1枚読み込めなくても、エクスポート全体は止めない
+      console.error("Failed to inline an image for export:", err);
+    }
+  }
+}
+
+function exportBaseName() {
+  if (!currentPath) return "untitled";
+  const fileName = currentPath.replace(/^.*[\\/]/, "");
+  return fileName.replace(/\.[^.]+$/, "") || "untitled";
+}
+
+async function buildExportContainer() {
+  const container = document.createElement("div");
+  container.innerHTML = preview.innerHTML;
+  await inlineImagesForExport(container);
+  return container;
+}
+
+function exportDocumentCss() {
+  return `
+    body {
+      font-family: -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic", sans-serif;
+      line-height: 1.7;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 24px;
+      color: #222;
+    }
+    img, svg { max-width: 100%; }
+    pre { background: #f5f5f5; padding: 10px; overflow-x: auto; }
+    code { background: #f5f5f5; padding: 2px 4px; }
+    blockquote { border-left: 4px solid #ccc; margin: 0; padding-left: 12px; color: #555; }
+  `;
+}
+
+async function doExportHtml() {
+  try {
+    const container = await buildExportContainer();
+    const title = exportBaseName();
+    const doc =
+      "<!DOCTYPE html>\n" +
+      '<html lang="en">\n' +
+      "<head>\n" +
+      '<meta charset="UTF-8">\n' +
+      `<title>${title}</title>\n` +
+      `<style>${exportDocumentCss()}</style>\n` +
+      "</head>\n" +
+      "<body>\n" +
+      container.innerHTML +
+      "\n</body>\n</html>\n";
+
+    const { invoke } = window.__TAURI__.core;
+    const savedPath = await invoke("export_html_dialog", {
+      content: doc,
+      defaultName: `${title}.html`
+    });
+    if (savedPath) {
+      flashStatus(`Exported: ${savedPath}`);
+    }
+  } catch (err) {
+    alert("Failed to export HTML: " + err);
+  }
+}
+
+async function doExportPdf() {
+  try {
+    const container = await buildExportContainer();
+    const printContainer = document.getElementById("print-container");
+    printContainer.innerHTML = "";
+    printContainer.appendChild(container);
+    // OS標準の印刷ダイアログを開く。PDFとして保存するには、
+    // ユーザーが出力先で「PDFに保存」等を選ぶ必要がある
+    // (Tauriには現時点でこれを自動化する公式APIが無いため)。
+    window.print();
+  } catch (err) {
+    alert("Failed to prepare PDF export: " + err);
+  }
+}
+
+// 印刷ダイアログが閉じたら、印刷専用コンテナの中身を掃除しておく
+window.addEventListener("afterprint", () => {
+  const printContainer = document.getElementById("print-container");
+  if (printContainer) printContainer.innerHTML = "";
+});
 
 editor.addEventListener("input", () => {
   markDirty();
@@ -214,7 +327,7 @@ window.addEventListener("load", () => {
   const { listen } = window.__TAURI__.event;
 
   // 「新規」: 今の内容を消して真っ白な状態にする
-  listen("menu-new", () => {
+  function doNew() {
     if (dirty && !confirm("You have unsaved changes. Create a new file anyway?")) {
       return;
     }
@@ -223,10 +336,10 @@ window.addEventListener("load", () => {
     dirty = false;
     render();
     updateStatusBar();
-  });
+  }
 
   // 「開く」: ダイアログでファイルを選び、内容をエディタに読み込む
-  listen("menu-open", async () => {
+  async function doOpen() {
     try {
       const result = await invoke("open_file_dialog");
       if (result) {
@@ -239,16 +352,21 @@ window.addEventListener("load", () => {
     } catch (err) {
       alert("Failed to open file: " + err);
     }
-  });
+  }
 
+  listen("menu-new", () => doNew());
+  listen("menu-open", () => doOpen());
   listen("menu-save", () => doSave());
   listen("menu-save-as", () => doSaveAs());
+  listen("menu-export-html", () => doExportHtml());
+  listen("menu-export-pdf", () => doExportPdf());
 
   // 「すべて選択」: 編集エリアの中身だけを選択する(画面全体は対象にしない)
-  listen("menu-select-all", () => {
+  function doSelectAll() {
     editor.focus();
     editor.select();
-  });
+  }
+  listen("menu-select-all", () => doSelectAll());
 
   // 保存すると、貼り付けた画像が文書と同じ場所へ移動され、
   // 本文中のリンクも書き換えられる。その書き換え後の内容を
@@ -285,4 +403,37 @@ window.addEventListener("load", () => {
       alert("Failed to save file: " + err);
     }
   }
+
+  // ---------------------------------------------------------------
+  // キーボードショートカットの直接検知
+  //
+  // ネイティブメニューのアクセラレータ(accelerator)は、環境によっては
+  // クリックは動くのにキー入力からは反応しないことがある既知の問題が
+  // あるため(参考: https://github.com/tauri-apps/tauri/issues/6365)、
+  // メニュー側の設定に頼らず、こちらでも直接キー入力を検知して同じ処理を
+  // 呼び出す。もしメニュー側のショートカットが正常に動く環境であっても、
+  // 同じ処理を呼ぶだけなので二重に実行される以外の実害はない想定。
+  // ---------------------------------------------------------------
+  document.addEventListener("keydown", (e) => {
+    const mod = e.ctrlKey || e.metaKey;
+    if (!mod) return;
+    const key = e.key.toLowerCase();
+
+    if (key === "s" && e.shiftKey) {
+      e.preventDefault();
+      doSaveAs();
+    } else if (key === "s") {
+      e.preventDefault();
+      doSave();
+    } else if (key === "n") {
+      e.preventDefault();
+      doNew();
+    } else if (key === "o") {
+      e.preventDefault();
+      doOpen();
+    } else if (key === "a") {
+      e.preventDefault();
+      doSelectAll();
+    }
+  });
 });

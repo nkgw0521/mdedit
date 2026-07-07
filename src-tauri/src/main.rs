@@ -220,6 +220,30 @@ fn save_file_dialog(app: tauri::AppHandle, content: String) -> Result<Option<Sav
     }))
 }
 
+// HTMLとしてエクスポートする(画像は既にbase64で埋め込まれた自己完結な内容を渡す想定)
+#[tauri::command]
+fn export_html_dialog(
+    app: tauri::AppHandle,
+    content: String,
+    default_name: String,
+) -> Result<Option<String>, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("HTML", &["html", "htm"])
+        .set_file_name(&default_name)
+        .blocking_save_file();
+
+    let Some(file_path) = picked else {
+        return Ok(None);
+    };
+
+    let path_buf: PathBuf = file_path.into_path().map_err(|e| e.to_string())?;
+    fs::write(&path_buf, content).map_err(|e| e.to_string())?;
+
+    Ok(Some(path_buf.to_string_lossy().to_string()))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -227,7 +251,8 @@ fn main() {
             open_file_dialog,
             save_file_to_path,
             save_file_dialog,
-            save_pasted_image
+            save_pasted_image,
+            export_html_dialog
         ])
         .setup(|app| {
             // ---- "File" menu ----
@@ -246,6 +271,12 @@ fn main() {
             let save_as_item = MenuItemBuilder::new("Save As...")
                 .id("save_as")
                 .accelerator("CmdOrCtrl+Shift+S")
+                .build(app)?;
+            let export_html_item = MenuItemBuilder::new("Export as HTML...")
+                .id("export_html")
+                .build(app)?;
+            let export_pdf_item = MenuItemBuilder::new("Export as PDF...")
+                .id("export_pdf")
                 .build(app)?;
             let select_all_item = MenuItemBuilder::new("Select All")
                 .id("select_all")
@@ -266,6 +297,9 @@ fn main() {
                 .separator()
                 .item(&save_item)
                 .item(&save_as_item)
+                .separator()
+                .item(&export_html_item)
+                .item(&export_pdf_item)
                 .separator()
                 .item(&quit_item)
                 .build()?;
@@ -303,6 +337,12 @@ fn main() {
                 }
                 "save_as" => {
                     let _ = app_handle.emit("menu-save-as", ());
+                }
+                "export_html" => {
+                    let _ = app_handle.emit("menu-export-html", ());
+                }
+                "export_pdf" => {
+                    let _ = app_handle.emit("menu-export-pdf", ());
                 }
                 "select_all" => {
                     let _ = app_handle.emit("menu-select-all", ());
