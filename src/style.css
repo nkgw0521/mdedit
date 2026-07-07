@@ -8,9 +8,83 @@ html, body {
   font-family: -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic", sans-serif;
 }
 
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+.tab-bar {
+  display: flex;
+  align-items: stretch;
+  background: #e8e8e8;
+  border-bottom: 1px solid #ccc;
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px 7px 12px;
+  font-size: 12px;
+  border-right: 1px solid #ccc;
+  cursor: pointer;
+  white-space: nowrap;
+  color: #444;
+  background: #e8e8e8;
+  max-width: 220px;
+}
+
+.tab:hover {
+  background: #dcdcdc;
+}
+
+.tab-active {
+  background: #ffffff;
+  color: #111;
+  font-weight: 600;
+}
+
+.tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-close {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  color: #888;
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+.tab-close:hover {
+  color: #fff;
+  background: #b00020;
+}
+
+.tab-new {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 4px 12px;
+  color: #555;
+}
+
+.tab-new:hover {
+  background: #dcdcdc;
+}
+
 .split-container {
   display: flex;
-  height: 100vh;
+  flex: 1;
+  min-height: 0;
   width: 100vw;
 }
 

@@ -4,12 +4,15 @@
 // 3. 貼り付けられた画像を ~/.mdedit/images に一時保存する
 // 4. 保存時に、その一時保存した画像を文書と同じ場所へ移し、
 //    Markdown本文のリンクを相対パスに書き換える(ポータビリティ確保)
+// 5. 複数タブのセッション情報(~/.mdedit/session.json)と、
+//    未保存タブの下書き(~/.mdedit/drafts/)の読み書き
 //
 // 参考(1次情報):
 // - メニュー: https://v2.tauri.app/learn/window-menu/
 // - ダイアログ: https://v2.tauri.app/plugin/dialog/
 // - asset protocol: https://v2.tauri.app/security/asset-protocol/
 // - path API (home_dir): https://v2.tauri.app/reference/javascript/api/namespacepath/
+// - ウィンドウを閉じる前の処理: https://v2.tauri.app/reference/javascript/api/namespacewindow/
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs;
@@ -45,12 +48,31 @@ struct SavedFile {
 // ヘルパー
 // ---------------------------------------------------------------
 
+// ~/.mdedit (アプリの設定・一時データ置き場) を返す
+fn mdedit_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let home = app.path().home_dir().map_err(|e| e.to_string())?;
+    Ok(home.join(".mdedit"))
+}
+
 // ~/.mdedit/images (画像の一時保存フォルダ) を返す。無ければ作る。
 fn staging_images_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let home = app.path().home_dir().map_err(|e| e.to_string())?;
-    let dir = home.join(".mdedit").join("images");
+    let dir = mdedit_dir(app)?.join("images");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
+}
+
+// ~/.mdedit/drafts (未保存タブの下書き置き場) を返す。無ければ作る。
+fn drafts_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = mdedit_dir(app)?.join("drafts");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+// ~/.mdedit/session.json (開いているタブ一覧の記録) のパスを返す
+fn session_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = mdedit_dir(app)?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("session.json"))
 }
 
 // 貼り付け画像用の一意なファイル名を作る
@@ -244,6 +266,55 @@ fn export_html_dialog(
     Ok(Some(path_buf.to_string_lossy().to_string()))
 }
 
+// パスを指定してテキストファイルを読む(タブ復元時、下書きや保存済みファイルの読み込みに使う汎用コマンド)
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
+// 未保存タブの内容を ~/.mdedit/drafts/<draft_id>.md に書き出す(終了時の一時保存用)
+#[tauri::command]
+fn write_draft(app: tauri::AppHandle, draft_id: String, content: String) -> Result<String, String> {
+    let dir = drafts_dir(&app)?;
+    // draft_id はJS側で生成したIDを想定しているが、念のためファイル名として
+    // 危険な文字(パス区切り文字など)は除去しておく
+    let safe_id: String = draft_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let file_path = dir.join(format!("{}.md", safe_id));
+    fs::write(&file_path, content).map_err(|e| e.to_string())?;
+    Ok(file_path.to_string_lossy().replace('\\', "/"))
+}
+
+// 不要になった下書きファイルを削除する(既に無い場合もエラーにしない)
+#[tauri::command]
+fn delete_draft(path: String) -> Result<(), String> {
+    match fs::remove_file(&path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// 開いているタブの一覧(セッション)を ~/.mdedit/session.json に保存する
+#[tauri::command]
+fn save_session(app: tauri::AppHandle, session_json: String) -> Result<(), String> {
+    let path = session_file_path(&app)?;
+    fs::write(&path, session_json).map_err(|e| e.to_string())
+}
+
+// 前回終了時のセッションを読み込む。ファイルが無ければ None を返す(初回起動など)。
+#[tauri::command]
+fn load_session(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let path = session_file_path(&app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    Ok(Some(content))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -252,7 +323,12 @@ fn main() {
             save_file_to_path,
             save_file_dialog,
             save_pasted_image,
-            export_html_dialog
+            export_html_dialog,
+            read_text_file,
+            write_draft,
+            delete_draft,
+            save_session,
+            load_session
         ])
         .setup(|app| {
             // ---- "File" menu ----
@@ -291,7 +367,7 @@ fn main() {
             let copy_item = PredefinedMenuItem::copy(app, Some("Copy"))?;
             let paste_item = PredefinedMenuItem::paste(app, Some("Paste"))?;
 
-            let file_menu = SubmenuBuilder::new(app, "File")
+            let file_menu = SubmenuBuilder::new(app, "&File")
                 .item(&new_item)
                 .item(&open_item)
                 .separator()
@@ -308,7 +384,7 @@ fn main() {
             // 「すべて選択」だけは、OS標準のものだと画面全体が対象になって
             // しまう(編集エリアの外まで選択される)ため、自前の項目にして
             // 「編集エリアの中身だけ」を選択するようフロント側に指示する。
-            let edit_menu = SubmenuBuilder::new(app, "Edit")
+            let edit_menu = SubmenuBuilder::new(app, "&Edit")
                 .item(&undo_item)
                 .item(&redo_item)
                 .separator()

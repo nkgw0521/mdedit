@@ -3,6 +3,9 @@
   "description": "メインウィンドウの基本パーミッション(イベント送受信・ウィンドウ操作など)",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:window:default",
+    "core:window:allow-destroy",
+    "core:window:allow-close"
   ]
 }

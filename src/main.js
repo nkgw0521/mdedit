@@ -52,6 +52,9 @@ md.renderer.rules.fence = (tokens, idx, options, env, self) => {
 // 表示できないので、Tauriの asset protocol (convertFileSrc) を
 // 使って、表示するときだけ特別なURLに変換する。
 // 参考(1次情報): https://v2.tauri.app/security/asset-protocol/
+//
+// パスの解決は「今アクティブなタブの保存先」を基準にするため、
+// activeTab() を参照する(タブ機能に対応)。
 // ---------------------------------------------------------------
 const defaultImageRenderer =
   md.renderer.rules.image ||
@@ -68,8 +71,6 @@ md.renderer.rules.image = (tokens, idx, options, env, self) => {
   return defaultImageRenderer(tokens, idx, options, env, self);
 };
 
-// http(s)/data: はそのまま。それ以外(ローカルパス)は絶対パスに解決してから
-// convertFileSrc で asset:// のURLに変換する。
 function resolveImageSrc(src) {
   if (/^(https?:|data:)/i.test(src)) {
     return src;
@@ -81,11 +82,12 @@ function resolveImageSrc(src) {
   const isAbsolute = isAbsoluteWin || isAbsoluteUnix || src.startsWith("\\\\");
 
   if (!isAbsolute) {
-    if (!currentPath) {
+    const tab = activeTab();
+    if (!tab || !tab.path) {
       // 保存前で、かつ相対パス指定 -> 解決しようがないのでそのまま返す
       return src;
     }
-    const dir = currentPath.replace(/[\\/][^\\/]*$/, "");
+    const dir = tab.path.replace(/[\\/][^\\/]*$/, "");
     absolute = dir + "/" + src;
   }
 
@@ -99,11 +101,215 @@ function resolveImageSrc(src) {
 const editor = document.getElementById("editor");
 const preview = document.getElementById("preview");
 const statusBar = document.getElementById("status-bar");
+const tabBar = document.getElementById("tab-bar");
 
-// 現在開いている(保存先の)ファイルパス。まだ保存していなければ null。
-let currentPath = null;
-// 前回保存した内容と違うかどうか
-let dirty = false;
+// ---------------------------------------------------------------
+// タブのデータモデル
+//
+// tabs: { id, path, content, dirty, draftPath }[]
+//   id        : タブごとの一意なID(下書きファイル名にも使う)
+//   path      : 保存先の実ファイルパス(未保存ならnull)
+//   content   : 現在の本文
+//   dirty     : 最後に保存した内容と違うか
+//   draftPath : 前回終了時に一時保存した下書きファイルのパス(無ければnull)
+// ---------------------------------------------------------------
+let tabs = [];
+let activeIndex = -1;
+
+const SAMPLE_CONTENT =
+  "# Sample\n\nType **Markdown** here and the preview will show up on the right.\n\n" +
+  "- List item 1\n- List item 2\n\n> Blockquotes are supported too.\n\n" +
+  "You can paste screenshots and other images directly into this text area (Ctrl+V).\n\n" +
+  "## Mermaid example\n\n```mermaid\nflowchart LR\n    A[Start] --> B{Condition}\n" +
+  "    B -->|Yes| C[Step A]\n    B -->|No| D[Step B]\n    C --> E[End]\n    D --> E\n```\n";
+
+function newTabId() {
+  return "tab-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
+
+function createTab({ path = null, content = "", dirty = false, draftPath = null } = {}) {
+  const tab = { id: newTabId(), path, content, dirty, draftPath };
+  tabs.push(tab);
+  return tab;
+}
+
+function activeTab() {
+  return tabs[activeIndex] || null;
+}
+
+function tabDisplayName(tab) {
+  const base = tab.path ? tab.path.replace(/^.*[\\/]/, "") : "Untitled";
+  return tab.dirty ? base + " *" : base;
+}
+
+function renderTabBar() {
+  tabBar.innerHTML = "";
+
+  tabs.forEach((tab, index) => {
+    const el = document.createElement("div");
+    el.className = "tab" + (index === activeIndex ? " tab-active" : "");
+    el.title = tab.path || "Untitled";
+
+    const label = document.createElement("span");
+    label.className = "tab-label";
+    label.textContent = tabDisplayName(tab);
+    el.appendChild(label);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "tab-close";
+    closeBtn.type = "button";
+    closeBtn.textContent = "\u00d7";
+    closeBtn.title = "Close";
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeTab(index);
+    });
+    el.appendChild(closeBtn);
+
+    el.addEventListener("click", () => switchToTab(index));
+    tabBar.appendChild(el);
+  });
+
+  const newTabBtn = document.createElement("button");
+  newTabBtn.className = "tab-new";
+  newTabBtn.type = "button";
+  newTabBtn.textContent = "+";
+  newTabBtn.title = "New tab (Ctrl+N)";
+  newTabBtn.addEventListener("click", () => doNew());
+  tabBar.appendChild(newTabBtn);
+}
+
+function switchToTab(index) {
+  if (index === activeIndex || !tabs[index]) return;
+  activeIndex = index;
+  editor.value = activeTab().content;
+  renderTabBar();
+  updateStatusBar();
+  render();
+}
+
+// 不要になった下書きファイルを削除する(保存済みになった/明示的に閉じられた場合)
+async function deleteDraftForTab(tab) {
+  if (tab.draftPath) {
+    try {
+      await window.__TAURI__.core.invoke("delete_draft", { path: tab.draftPath });
+    } catch (err) {
+      // 削除に失敗しても致命的ではないので無視する
+    }
+    tab.draftPath = null;
+  }
+}
+
+// タブを閉じる(タブバーのxボタン、および将来的にショートカット等から呼ぶ)
+async function closeTab(index) {
+  const tab = tabs[index];
+  if (!tab) return;
+
+  if (tab.dirty && !confirm(`"${tabDisplayName(tab)}" has unsaved changes. Close anyway?`)) {
+    return;
+  }
+
+  await deleteDraftForTab(tab);
+  tabs.splice(index, 1);
+
+  if (tabs.length === 0) {
+    createTab({ content: "" });
+    activeIndex = 0;
+  } else if (activeIndex >= tabs.length) {
+    activeIndex = tabs.length - 1;
+  } else if (index < activeIndex) {
+    activeIndex -= 1;
+  }
+
+  editor.value = activeTab().content;
+  renderTabBar();
+  updateStatusBar();
+  render();
+}
+
+// ---- 「新規」: 新しいタブを追加する ----
+function doNew() {
+  createTab({ content: "" });
+  activeIndex = tabs.length - 1;
+  editor.value = "";
+  renderTabBar();
+  updateStatusBar();
+  render();
+}
+
+// ---- 「開く」: すでに同じパスのタブが開いていればそこへ切り替え、
+//      無ければ新しいタブを作って読み込む ----
+async function doOpen() {
+  try {
+    const result = await window.__TAURI__.core.invoke("open_file_dialog");
+    if (!result) return;
+
+    const existingIndex = tabs.findIndex((t) => t.path === result.path);
+    if (existingIndex !== -1) {
+      switchToTab(existingIndex);
+      return;
+    }
+
+    createTab({ path: result.path, content: result.content, dirty: false });
+    activeIndex = tabs.length - 1;
+    editor.value = result.content;
+    renderTabBar();
+    updateStatusBar();
+    render();
+  } catch (err) {
+    alert("Failed to open file: " + err);
+  }
+}
+
+// ---- 「保存」/「名前を付けて保存」(アクティブなタブが対象) ----
+async function doSave() {
+  const tab = activeTab();
+  if (!tab) return;
+  if (!tab.path) {
+    return doSaveAs();
+  }
+  try {
+    const migratedContent = await window.__TAURI__.core.invoke("save_file_to_path", {
+      path: tab.path,
+      content: tab.content
+    });
+    tab.content = migratedContent;
+    tab.dirty = false;
+    editor.value = tab.content;
+    await deleteDraftForTab(tab);
+    renderTabBar();
+    updateStatusBar();
+    render();
+  } catch (err) {
+    alert("Failed to save file: " + err);
+  }
+}
+
+async function doSaveAs() {
+  const tab = activeTab();
+  if (!tab) return;
+  try {
+    const saved = await window.__TAURI__.core.invoke("save_file_dialog", { content: tab.content });
+    if (saved) {
+      tab.path = saved.path;
+      tab.content = saved.content;
+      tab.dirty = false;
+      editor.value = tab.content;
+      await deleteDraftForTab(tab);
+      renderTabBar();
+      updateStatusBar();
+      render();
+    }
+  } catch (err) {
+    alert("Failed to save file: " + err);
+  }
+}
+
+// ---- 「すべて選択」: 編集エリアの中身だけを選択する(画面全体は対象にしない) ----
+function doSelectAll() {
+  editor.focus();
+  editor.select();
+}
 
 async function render() {
   pendingMermaidBlocks = [];
@@ -132,19 +338,19 @@ async function render() {
 }
 
 function updateStatusBar() {
-  const name = currentPath ? currentPath : "Untitled";
-  statusBar.textContent = dirty ? `${name} *` : name;
+  const tab = activeTab();
+  if (!tab) {
+    statusBar.textContent = "No file open";
+    return;
+  }
+  const name = tab.path ? tab.path : "Untitled";
+  statusBar.textContent = tab.dirty ? `${name} *` : name;
 }
 
 // 一時的にステータスバーへメッセージを表示し、しばらくしたら通常表示に戻す
 function flashStatus(message) {
   statusBar.textContent = message;
   setTimeout(updateStatusBar, 2500);
-}
-
-function markDirty() {
-  dirty = true;
-  updateStatusBar();
 }
 
 function insertAtCursor(textarea, text) {
@@ -167,13 +373,7 @@ function blobToDataUrl(blob) {
 let renderDebounceTimer = null;
 
 // ---------------------------------------------------------------
-// HTML / PDF エクスポート
-//
-// プレビュー(preview.innerHTML)は、この時点で既に
-// Markdown -> HTML変換 と Mermaid -> SVG変換が完了した状態なので、
-// それをそのまま書き出しの元にする。
-// 画像はasset://のURLになっているので、エクスポート後もどこでも
-// 見られるようbase64(data:)に変換してから埋め込む。
+// HTML / PDF エクスポート(アクティブなタブの内容が対象)
 // ---------------------------------------------------------------
 
 async function inlineImagesForExport(container) {
@@ -187,15 +387,15 @@ async function inlineImagesForExport(container) {
       const dataUrl = await blobToDataUrl(blob);
       img.setAttribute("src", dataUrl);
     } catch (err) {
-      // 1枚読み込めなくても、エクスポート全体は止めない
       console.error("Failed to inline an image for export:", err);
     }
   }
 }
 
 function exportBaseName() {
-  if (!currentPath) return "untitled";
-  const fileName = currentPath.replace(/^.*[\\/]/, "");
+  const tab = activeTab();
+  if (!tab || !tab.path) return "untitled";
+  const fileName = tab.path.replace(/^.*[\\/]/, "");
   return fileName.replace(/\.[^.]+$/, "") || "untitled";
 }
 
@@ -273,8 +473,15 @@ window.addEventListener("afterprint", () => {
   if (printContainer) printContainer.innerHTML = "";
 });
 
+// ---- 編集内容をタブへ反映 + プレビュー更新(debounce付き) ----
 editor.addEventListener("input", () => {
-  markDirty();
+  const tab = activeTab();
+  if (tab) {
+    tab.content = editor.value;
+    tab.dirty = true;
+  }
+  renderTabBar();
+  updateStatusBar();
   clearTimeout(renderDebounceTimer);
   renderDebounceTimer = setTimeout(render, 250);
 });
@@ -301,8 +508,14 @@ editor.addEventListener("paste", async (e) => {
         const { invoke } = window.__TAURI__.core;
         const path = await invoke("save_pasted_image", { dataBase64: base64Data, mime });
         insertAtCursor(editor, `![](${path})\n`);
+        const tab = activeTab();
+        if (tab) {
+          tab.content = editor.value;
+          tab.dirty = true;
+        }
+        renderTabBar();
+        updateStatusBar();
         render();
-        markDirty();
       } catch (err) {
         alert("Failed to save image: " + err);
       }
@@ -311,48 +524,21 @@ editor.addEventListener("paste", async (e) => {
   }
 });
 
-// 起動時のサンプル表示
-editor.value = "# Sample\n\nType **Markdown** here and the preview will show up on the right.\n\n- List item 1\n- List item 2\n\n> Blockquotes are supported too.\n\nYou can paste screenshots and other images directly into this text area (Ctrl+V).\n\n## Mermaid example\n\n```mermaid\nflowchart LR\n    A[Start] --> B{Condition}\n    B -->|Yes| C[Step A]\n    B -->|No| D[Step B]\n    C --> E[End]\n    D --> E\n```\n";
-render();
-updateStatusBar();
-
 // ------------------------------------------------------------
-// メニュー(ファイル/編集)との連携
+// メニュー(ファイル/編集)との連携、セッションの保存/復元
 // window.__TAURI__ は index.html 読み込み完了(load)より前だと
 // 未定義になることがあるため、load イベントの中で初期化する。
 // 参考(1次情報): https://github.com/tauri-apps/tauri/issues/12990
 // ------------------------------------------------------------
-window.addEventListener("load", () => {
+window.addEventListener("load", async () => {
   const { invoke } = window.__TAURI__.core;
   const { listen } = window.__TAURI__.event;
 
-  // 「新規」: 今の内容を消して真っ白な状態にする
-  function doNew() {
-    if (dirty && !confirm("You have unsaved changes. Create a new file anyway?")) {
-      return;
-    }
-    editor.value = "";
-    currentPath = null;
-    dirty = false;
-    render();
-    updateStatusBar();
-  }
-
-  // 「開く」: ダイアログでファイルを選び、内容をエディタに読み込む
-  async function doOpen() {
-    try {
-      const result = await invoke("open_file_dialog");
-      if (result) {
-        editor.value = result.content;
-        currentPath = result.path;
-        dirty = false;
-        render();
-        updateStatusBar();
-      }
-    } catch (err) {
-      alert("Failed to open file: " + err);
-    }
-  }
+  await restoreSessionOrDefault();
+  editor.value = activeTab() ? activeTab().content : "";
+  renderTabBar();
+  updateStatusBar();
+  await render();
 
   listen("menu-new", () => doNew());
   listen("menu-open", () => doOpen());
@@ -360,49 +546,7 @@ window.addEventListener("load", () => {
   listen("menu-save-as", () => doSaveAs());
   listen("menu-export-html", () => doExportHtml());
   listen("menu-export-pdf", () => doExportPdf());
-
-  // 「すべて選択」: 編集エリアの中身だけを選択する(画面全体は対象にしない)
-  function doSelectAll() {
-    editor.focus();
-    editor.select();
-  }
   listen("menu-select-all", () => doSelectAll());
-
-  // 保存すると、貼り付けた画像が文書と同じ場所へ移動され、
-  // 本文中のリンクも書き換えられる。その書き換え後の内容を
-  // Rust側から受け取り、エディタの表示にも反映する。
-  async function doSave() {
-    if (!currentPath) {
-      return doSaveAs();
-    }
-    try {
-      const migratedContent = await invoke("save_file_to_path", {
-        path: currentPath,
-        content: editor.value
-      });
-      editor.value = migratedContent;
-      dirty = false;
-      render();
-      updateStatusBar();
-    } catch (err) {
-      alert("Failed to save file: " + err);
-    }
-  }
-
-  async function doSaveAs() {
-    try {
-      const saved = await invoke("save_file_dialog", { content: editor.value });
-      if (saved) {
-        currentPath = saved.path;
-        editor.value = saved.content;
-        dirty = false;
-        render();
-        updateStatusBar();
-      }
-    } catch (err) {
-      alert("Failed to save file: " + err);
-    }
-  }
 
   // ---------------------------------------------------------------
   // キーボードショートカットの直接検知
@@ -411,8 +555,7 @@ window.addEventListener("load", () => {
   // クリックは動くのにキー入力からは反応しないことがある既知の問題が
   // あるため(参考: https://github.com/tauri-apps/tauri/issues/6365)、
   // メニュー側の設定に頼らず、こちらでも直接キー入力を検知して同じ処理を
-  // 呼び出す。もしメニュー側のショートカットが正常に動く環境であっても、
-  // 同じ処理を呼ぶだけなので二重に実行される以外の実害はない想定。
+  // 呼び出す。
   // ---------------------------------------------------------------
   document.addEventListener("keydown", (e) => {
     const mod = e.ctrlKey || e.metaKey;
@@ -436,4 +579,137 @@ window.addEventListener("load", () => {
       doSelectAll();
     }
   });
+
+  // ---------------------------------------------------------------
+  // セッションの保存(終了時)
+  //
+  // ウィンドウが閉じられる直前にこの処理が呼ばれる。ここで
+  //   - 未保存(dirty)または保存先未定のタブの内容を下書きとして
+  //     ~/.mdedit/drafts/ に書き出す
+  //   - 開いていたタブの一覧(パスと下書きパス)を
+  //     ~/.mdedit/session.json に書き出す
+  // ことで、次回起動時に元通り復元できるようにする。
+  //
+  // 参考(1次情報): https://v2.tauri.app/reference/javascript/api/namespacewindow/
+  // ここでは event.preventDefault() を呼ばないので、この処理が終わった後は
+  // 通常通りウィンドウが閉じる(先に確認したTauri公式ドキュメントの挙動)。
+  // ---------------------------------------------------------------
+  async function saveSessionForExit() {
+    const current = activeTab();
+    if (current) current.content = editor.value;
+
+    const sessionTabs = [];
+    for (const tab of tabs) {
+      const needsDraft = tab.dirty || !tab.path;
+
+      if (needsDraft && tab.content.length > 0) {
+        try {
+          tab.draftPath = await invoke("write_draft", { draftId: tab.id, content: tab.content });
+        } catch (err) {
+          // 下書きの保存に失敗しても、パスだけは記録して次を続ける
+        }
+      } else if (!needsDraft) {
+        await deleteDraftForTab(tab);
+      }
+
+      sessionTabs.push({ path: tab.path, draftPath: tab.draftPath });
+    }
+
+    try {
+      await invoke("save_session", {
+        sessionJson: JSON.stringify({ tabs: sessionTabs, activeIndex })
+      });
+    } catch (err) {
+      // セッションの保存に失敗しても、アプリを閉じられなくなるのは避けたいので無視する
+    }
+  }
+
+  try {
+    const { getCurrentWindow } = window.__TAURI__.window;
+    const currentWindow = getCurrentWindow();
+
+    await currentWindow.onCloseRequested(async () => {
+      console.log("[mdedit] close-requested handler fired");
+      // 何らかの理由でセッション保存処理が失敗/ハングしても、
+      // ウィンドウが二度と閉じられなくなる事態だけは避けたいので、
+      // タイムアウト付きで実行し、最後に必ず destroy() で強制的に閉じる。
+      // (公式ドキュメントによれば close() はcloseRequestedイベントを
+      //  再度発生させるだけで、確実に閉じるには destroy() が必要)
+      // 参考(1次情報): https://v2.tauri.app/reference/javascript/api/namespacewindow/
+      try {
+        await Promise.race([
+          saveSessionForExit(),
+          new Promise((resolve) => setTimeout(resolve, 3000))
+        ]);
+        console.log("[mdedit] session save finished (or timed out)");
+      } catch (err) {
+        console.error("[mdedit] Failed to save session on exit:", err);
+      } finally {
+        try {
+          console.log("[mdedit] calling destroy()");
+          await currentWindow.destroy();
+          console.log("[mdedit] destroy() resolved");
+        } catch (err) {
+          console.error("[mdedit] Failed to destroy window:", err);
+        }
+      }
+    });
+    console.log("[mdedit] close handler registered");
+  } catch (err) {
+    console.error("[mdedit] Failed to register close handler:", err);
+  }
+
+  // ---------------------------------------------------------------
+  // 起動時のセッション復元
+  //
+  // ~/.mdedit/session.json が無い(初回起動)場合はサンプルを1つ表示する。
+  // ある場合は、各タブについて下書き(draftPath)があればそれを優先して
+  // 読み込み(= 未保存の内容を復元)、無ければ保存済みファイル(path)を
+  // 読み込む。
+  // ---------------------------------------------------------------
+  async function restoreSessionOrDefault() {
+    let sessionRaw = null;
+    try {
+      sessionRaw = await invoke("load_session");
+    } catch (err) {
+      sessionRaw = null;
+    }
+
+    let session = null;
+    if (sessionRaw) {
+      try {
+        session = JSON.parse(sessionRaw);
+      } catch (err) {
+        session = null;
+      }
+    }
+
+    if (!session || !Array.isArray(session.tabs) || session.tabs.length === 0) {
+      createTab({ content: SAMPLE_CONTENT });
+      activeIndex = 0;
+      return;
+    }
+
+    for (const entry of session.tabs) {
+      let content = "";
+      let dirty = false;
+
+      try {
+        if (entry.draftPath) {
+          content = await invoke("read_text_file", { path: entry.draftPath });
+          dirty = true; // 下書きから復元したものは「未保存」のままにしておく
+        } else if (entry.path) {
+          content = await invoke("read_text_file", { path: entry.path });
+        }
+      } catch (err) {
+        content = ""; // 元ファイル/下書きが見つからない場合は空で復元する
+      }
+
+      const tab = createTab({ path: entry.path || null, content, dirty });
+      tab.draftPath = entry.draftPath || null;
+    }
+
+    const restoredIndex = Number.isInteger(session.activeIndex) ? session.activeIndex : 0;
+    activeIndex = Math.min(Math.max(restoredIndex, 0), tabs.length - 1);
+  }
 });
