@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Markdown Editor</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="split-container">
+    <div class="pane pane-editor">
+      <div class="pane-header" id="status-bar">Untitled</div>
+      <textarea id="editor" placeholder="# Type your Markdown here"></textarea>
+    </div>
+    <div class="pane pane-preview">
+      <div class="pane-header">Preview</div>
+      <div id="preview" class="preview-body"></div>
+    </div>
+  </div>
+
+  <script src="vendor/markdown-it.min.js"></script>
+  <script src="vendor/mermaid.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>
