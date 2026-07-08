@@ -142,6 +142,8 @@ function tabDisplayName(tab) {
   return tab.dirty ? base + " *" : base;
 }
 
+let draggedTabIndex = null;
+
 function renderTabBar() {
   tabBar.innerHTML = "";
 
@@ -149,6 +151,7 @@ function renderTabBar() {
     const el = document.createElement("div");
     el.className = "tab" + (index === activeIndex ? " tab-active" : "");
     el.title = tab.path || "Untitled";
+    el.draggable = true;
 
     const label = document.createElement("span");
     label.className = "tab-label";
@@ -167,6 +170,36 @@ function renderTabBar() {
     el.appendChild(closeBtn);
 
     el.addEventListener("click", () => switchToTab(index));
+
+    // ---- ドラッグ&ドロップでの並び替え ----
+    el.addEventListener("dragstart", (e) => {
+      draggedTabIndex = index;
+      el.classList.add("tab-dragging");
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", String(index)); // 一部環境で必要
+      }
+    });
+
+    el.addEventListener("dragend", () => {
+      draggedTabIndex = null;
+      el.classList.remove("tab-dragging");
+    });
+
+    el.addEventListener("dragover", (e) => {
+      // ドロップを許可するために既定動作を止める必要がある
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    });
+
+    el.addEventListener("drop", (e) => {
+      e.preventDefault();
+      e.stopPropagation(); // タブバー本体側のドロップ処理(末尾移動)と二重に動かないようにする
+      if (draggedTabIndex === null || draggedTabIndex === index) return;
+      reorderTabs(draggedTabIndex, index);
+      draggedTabIndex = null;
+    });
+
     tabBar.appendChild(el);
   });
 
@@ -179,6 +212,56 @@ function renderTabBar() {
   tabBar.appendChild(newTabBtn);
 }
 
+// タブバー自体(タブとタブの隙間や、最後のタブより右側の余白)にドロップされた場合は、
+// 「末尾へ移動」として扱う。個々のタブのdrop処理はstopPropagation()しているので、
+// ここに届くのはタブの上ではない場所へドロップされたときだけ。
+tabBar.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+});
+
+tabBar.addEventListener("drop", (e) => {
+  e.preventDefault();
+  if (draggedTabIndex === null) return;
+  moveTabToEnd(draggedTabIndex);
+  draggedTabIndex = null;
+});
+
+function moveTabToEnd(index) {
+  if (!tabs[index]) return;
+  const activeId = activeTab() ? activeTab().id : null;
+
+  const [moved] = tabs.splice(index, 1);
+  tabs.push(moved);
+
+  if (activeId !== null) {
+    const idx = tabs.findIndex((t) => t.id === activeId);
+    if (idx !== -1) activeIndex = idx;
+  }
+
+  renderTabBar();
+}
+
+// タブをfromIndexからtoIndexの位置へ移動する。
+// アクティブなタブがずれても正しく追従するよう、
+// インデックスの計算ではなくタブのidで追跡し直す。
+function reorderTabs(fromIndex, toIndex) {
+  if (fromIndex === toIndex || !tabs[fromIndex] || !tabs[toIndex]) return;
+
+  const activeId = activeTab() ? activeTab().id : null;
+
+  const [moved] = tabs.splice(fromIndex, 1);
+  const insertIndex = fromIndex < toIndex ? toIndex - 1 : toIndex;
+  tabs.splice(insertIndex, 0, moved);
+
+  if (activeId !== null) {
+    const idx = tabs.findIndex((t) => t.id === activeId);
+    if (idx !== -1) activeIndex = idx;
+  }
+
+  renderTabBar();
+}
+
 function switchToTab(index) {
   if (index === activeIndex || !tabs[index]) return;
   activeIndex = index;
@@ -186,6 +269,13 @@ function switchToTab(index) {
   renderTabBar();
   updateStatusBar();
   render();
+}
+
+// 次/前のタブへ切り替える(Ctrl+Tab / Ctrl+Shift+Tab用)
+function switchToAdjacentTab(direction) {
+  if (tabs.length < 2) return;
+  const nextIndex = (activeIndex + direction + tabs.length) % tabs.length;
+  switchToTab(nextIndex);
 }
 
 // 不要になった下書きファイルを削除する(保存済みになった/明示的に閉じられた場合)
@@ -577,6 +667,9 @@ window.addEventListener("load", async () => {
     } else if (key === "a") {
       e.preventDefault();
       doSelectAll();
+    } else if (key === "tab") {
+      e.preventDefault();
+      switchToAdjacentTab(e.shiftKey ? -1 : 1);
     }
   });
 

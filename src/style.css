@@ -46,6 +46,10 @@ body {
   font-weight: 600;
 }
 
+.tab-dragging {
+  opacity: 0.4;
+}
+
 .tab-label {
   overflow: hidden;
   text-overflow: ellipsis;
