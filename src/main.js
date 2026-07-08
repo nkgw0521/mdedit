@@ -102,6 +102,38 @@ const editor = document.getElementById("editor");
 const preview = document.getElementById("preview");
 const statusBar = document.getElementById("status-bar");
 const tabBar = document.getElementById("tab-bar");
+const paneEditor = document.getElementById("pane-editor");
+const splitDivider = document.getElementById("split-divider");
+const splitContainer = document.querySelector(".split-container");
+
+// ---------------------------------------------------------------
+// 中央の分割線をドラッグして、編集/プレビューの幅を変えられるようにする
+// ---------------------------------------------------------------
+let isDraggingSplit = false;
+
+splitDivider.addEventListener("mousedown", (e) => {
+  isDraggingSplit = true;
+  splitDivider.classList.add("dragging");
+  document.body.classList.add("split-resizing");
+  e.preventDefault();
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (!isDraggingSplit) return;
+  const rect = splitContainer.getBoundingClientRect();
+  const minWidth = 200; // 左右とも、これより狭くはしない
+  const maxWidth = rect.width - minWidth - splitDivider.offsetWidth;
+  let newWidth = e.clientX - rect.left;
+  newWidth = Math.max(minWidth, Math.min(maxWidth, newWidth));
+  paneEditor.style.width = newWidth + "px";
+});
+
+window.addEventListener("mouseup", () => {
+  if (!isDraggingSplit) return;
+  isDraggingSplit = false;
+  splitDivider.classList.remove("dragging");
+  document.body.classList.remove("split-resizing");
+});
 
 // ---------------------------------------------------------------
 // タブのデータモデル

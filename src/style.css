@@ -95,13 +95,36 @@ body {
 .pane {
   display: flex;
   flex-direction: column;
-  width: 50%;
   height: 100%;
   min-width: 0;
 }
 
 .pane-editor {
-  border-right: 1px solid #d0d0d0;
+  width: 50%;
+  flex: 0 0 auto;
+}
+
+.pane-preview {
+  flex: 1 1 auto;
+}
+
+.split-divider {
+  flex: 0 0 6px;
+  width: 6px;
+  cursor: col-resize;
+  background: #d0d0d0;
+}
+
+.split-divider:hover,
+.split-divider.dragging {
+  background: #1e6e96;
+}
+
+/* ドラッグ中は、マウスが分割線から少し外れてもテキスト選択などが
+   起きないようにする */
+body.split-resizing {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .pane-header {
