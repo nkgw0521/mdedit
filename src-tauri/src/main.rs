@@ -203,7 +203,7 @@ fn open_file_dialog(app: tauri::AppHandle) -> Result<Option<OpenedFile>, String>
     let content = fs::read_to_string(&path_buf).map_err(|e| e.to_string())?;
 
     Ok(Some(OpenedFile {
-        path: path_buf.to_string_lossy().to_string(),
+        path: path_buf.to_string_lossy().replace('\\', "/"),
         content,
     }))
 }
@@ -237,7 +237,7 @@ fn save_file_dialog(app: tauri::AppHandle, content: String) -> Result<Option<Sav
     fs::write(&path_buf, &migrated).map_err(|e| e.to_string())?;
 
     Ok(Some(SavedFile {
-        path: path_buf.to_string_lossy().to_string(),
+        path: path_buf.to_string_lossy().replace('\\', "/"),
         content: migrated,
     }))
 }

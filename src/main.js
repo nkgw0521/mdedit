@@ -169,6 +169,13 @@ function activeTab() {
   return tabs[activeIndex] || null;
 }
 
+// パス文字列をフォワードスラッシュへ統一する。
+// 画像パスの組み立て(resolveImageSrc)で区切り文字が混在すると
+// パスが壊れるため、tab.pathを設定する箇所では必ずこれを通す。
+function normalizePath(p) {
+  return p ? p.replace(/\\/g, "/") : p;
+}
+
 function tabDisplayName(tab) {
   const base = tab.path ? tab.path.replace(/^.*[\\/]/, "") : "Untitled";
   return tab.dirty ? base + " *" : base;
@@ -365,14 +372,15 @@ async function doOpen() {
   try {
     const result = await window.__TAURI__.core.invoke("open_file_dialog");
     if (!result) return;
+    const normalizedPath = normalizePath(result.path);
 
-    const existingIndex = tabs.findIndex((t) => t.path === result.path);
+    const existingIndex = tabs.findIndex((t) => t.path === normalizedPath);
     if (existingIndex !== -1) {
       switchToTab(existingIndex);
       return;
     }
 
-    createTab({ path: result.path, content: result.content, dirty: false });
+    createTab({ path: normalizedPath, content: result.content, dirty: false });
     activeIndex = tabs.length - 1;
     editor.value = result.content;
     renderTabBar();
@@ -413,7 +421,7 @@ async function doSaveAs() {
   try {
     const saved = await window.__TAURI__.core.invoke("save_file_dialog", { content: tab.content });
     if (saved) {
-      tab.path = saved.path;
+      tab.path = normalizePath(saved.path);
       tab.content = saved.content;
       tab.dirty = false;
       editor.value = tab.content;
@@ -896,7 +904,7 @@ window.addEventListener("load", async () => {
         content = ""; // 元ファイル/下書きが見つからない場合は空で復元する
       }
 
-      const tab = createTab({ path: entry.path || null, content, dirty });
+      const tab = createTab({ path: normalizePath(entry.path) || null, content, dirty });
       tab.draftPath = entry.draftPath || null;
     }
 
