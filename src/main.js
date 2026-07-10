@@ -76,10 +76,21 @@ function resolveImageSrc(src) {
     return src;
   }
 
-  let absolute = src;
-  const isAbsoluteWin = /^[a-zA-Z]:[\\/]/.test(src);
-  const isAbsoluteUnix = src.startsWith("/");
-  const isAbsolute = isAbsoluteWin || isAbsoluteUnix || src.startsWith("\\\\");
+  // markdown-itはパース時にURLを正規化する際、日本語などの非ASCII文字を
+  // 自動でパーセントエンコード(%E6%97%A5...のような形式)してしまう仕様がある。
+  // ここでのsrcは実際のファイルパスとして扱いたいので、先に元の文字列へ戻す。
+  // 参考(1次情報): https://github.com/nanyuantingfeng/markdown-it-disable-url-encode
+  let decoded = src;
+  try {
+    decoded = decodeURIComponent(src);
+  } catch (err) {
+    decoded = src; // 正しくデコードできない場合はそのまま使う
+  }
+
+  let absolute = decoded;
+  const isAbsoluteWin = /^[a-zA-Z]:[\\/]/.test(decoded);
+  const isAbsoluteUnix = decoded.startsWith("/");
+  const isAbsolute = isAbsoluteWin || isAbsoluteUnix || decoded.startsWith("\\\\");
 
   if (!isAbsolute) {
     const tab = activeTab();
@@ -88,7 +99,7 @@ function resolveImageSrc(src) {
       return src;
     }
     const dir = tab.path.replace(/[\\/][^\\/]*$/, "");
-    absolute = dir + "/" + src;
+    absolute = dir + "/" + decoded;
   }
 
   try {
