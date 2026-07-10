@@ -361,11 +361,20 @@ fn main() {
             // 標準項目(OSやライブラリ側の既定動作)も、既定のテキストに頼らず
             // 明示的に英語を指定しておく(環境によって表示言語が変わらないように)
             let quit_item = PredefinedMenuItem::quit(app, Some("Quit"))?;
-            let undo_item = PredefinedMenuItem::undo(app, Some("Undo"))?;
-            let redo_item = PredefinedMenuItem::redo(app, Some("Redo"))?;
             let cut_item = PredefinedMenuItem::cut(app, Some("Cut"))?;
             let copy_item = PredefinedMenuItem::copy(app, Some("Copy"))?;
             let paste_item = PredefinedMenuItem::paste(app, Some("Paste"))?;
+            // Undo/Redoは、OS標準のものだと編集エリアに正しく効かないことがある
+            // (Select Allで判明したのと同じ種類の問題)ため、自前の項目にして
+            // フロント側で実装したundo/redoスタックを操作する。
+            let undo_item = MenuItemBuilder::new("Undo")
+                .id("undo")
+                .accelerator("CmdOrCtrl+Z")
+                .build(app)?;
+            let redo_item = MenuItemBuilder::new("Redo")
+                .id("redo")
+                .accelerator("CmdOrCtrl+Y")
+                .build(app)?;
 
             let file_menu = SubmenuBuilder::new(app, "&File")
                 .item(&new_item)
@@ -419,6 +428,12 @@ fn main() {
                 }
                 "export_pdf" => {
                     let _ = app_handle.emit("menu-export-pdf", ());
+                }
+                "undo" => {
+                    let _ = app_handle.emit("menu-undo", ());
+                }
+                "redo" => {
+                    let _ = app_handle.emit("menu-redo", ());
                 }
                 "select_all" => {
                     let _ = app_handle.emit("menu-select-all", ());

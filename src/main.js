@@ -160,7 +160,7 @@ function newTabId() {
 }
 
 function createTab({ path = null, content = "", dirty = false, draftPath = null } = {}) {
-  const tab = { id: newTabId(), path, content, dirty, draftPath };
+  const tab = { id: newTabId(), path, content, dirty, draftPath, undoStack: [], redoStack: [] };
   tabs.push(tab);
   return tab;
 }
@@ -433,6 +433,50 @@ function doSelectAll() {
   editor.select();
 }
 
+// ---------------------------------------------------------------
+// Undo / Redo
+//
+// OS標準のUndo/Redoメニュー項目は、Select Allと同様に編集エリアへ
+// 正しく効かないことがあるため、タブごとに自前でスナップショット
+// (直前の内容)を積んでおき、Undo/Redoで復元する方式にしている。
+// キー入力ではなく「入力が一段落するたび」(500ms止まったら)に1つ
+// 積むことで、1文字ずつ戻るのではなく、ある程度まとまった単位で
+// 元に戻せるようにしている。
+// ---------------------------------------------------------------
+let undoDebounceTimer = null;
+
+function pushUndoSnapshot(tab) {
+  const last = tab.undoStack[tab.undoStack.length - 1];
+  if (last === tab.content) return; // 前回から変化が無いなら積まない
+  tab.undoStack.push(tab.content);
+  if (tab.undoStack.length > 200) tab.undoStack.shift(); // 際限なく増えないよう上限を設ける
+  tab.redoStack.length = 0; // 新しい編集をしたら、それより前のredo履歴は無効
+}
+
+function doUndo() {
+  const tab = activeTab();
+  if (!tab || tab.undoStack.length === 0) return;
+  tab.redoStack.push(tab.content);
+  tab.content = tab.undoStack.pop();
+  tab.dirty = true;
+  editor.value = tab.content;
+  renderTabBar();
+  updateStatusBar();
+  render();
+}
+
+function doRedo() {
+  const tab = activeTab();
+  if (!tab || tab.redoStack.length === 0) return;
+  tab.undoStack.push(tab.content);
+  tab.content = tab.redoStack.pop();
+  tab.dirty = true;
+  editor.value = tab.content;
+  renderTabBar();
+  updateStatusBar();
+  render();
+}
+
 async function render() {
   pendingMermaidBlocks = [];
   preview.innerHTML = md.render(editor.value);
@@ -599,6 +643,14 @@ window.addEventListener("afterprint", () => {
 editor.addEventListener("input", () => {
   const tab = activeTab();
   if (tab) {
+    if (!undoDebounceTimer) {
+      pushUndoSnapshot(tab); // このひとまとまりの入力の最初のキーで、直前の内容を1つ積む
+    }
+    clearTimeout(undoDebounceTimer);
+    undoDebounceTimer = setTimeout(() => {
+      undoDebounceTimer = null;
+    }, 500);
+
     tab.content = editor.value;
     tab.dirty = true;
   }
@@ -629,8 +681,11 @@ editor.addEventListener("paste", async (e) => {
       try {
         const { invoke } = window.__TAURI__.core;
         const path = await invoke("save_pasted_image", { dataBase64: base64Data, mime });
-        insertAtCursor(editor, `![](${path})\n`);
         const tab = activeTab();
+        if (tab) {
+          pushUndoSnapshot(tab);
+        }
+        insertAtCursor(editor, `![](${path})\n`);
         if (tab) {
           tab.content = editor.value;
           tab.dirty = true;
@@ -669,6 +724,8 @@ window.addEventListener("load", async () => {
   listen("menu-export-html", () => doExportHtml());
   listen("menu-export-pdf", () => doExportPdf());
   listen("menu-select-all", () => doSelectAll());
+  listen("menu-undo", () => doUndo());
+  listen("menu-redo", () => doRedo());
 
   // ---------------------------------------------------------------
   // キーボードショートカットの直接検知
@@ -702,6 +759,15 @@ window.addEventListener("load", async () => {
     } else if (key === "tab") {
       e.preventDefault();
       switchToAdjacentTab(e.shiftKey ? -1 : 1);
+    } else if (key === "z" && e.shiftKey) {
+      e.preventDefault();
+      doRedo(); // Ctrl+Shift+Z を Redo の別名として扱う(慣習に合わせて)
+    } else if (key === "z") {
+      e.preventDefault();
+      doUndo();
+    } else if (key === "y") {
+      e.preventDefault();
+      doRedo();
     }
   });
 
