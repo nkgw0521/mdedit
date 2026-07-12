@@ -16,10 +16,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arboard::Clipboard;
 use base64::{engine::general_purpose, Engine as _};
+use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 use regex::Regex;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Emitter, Manager};
@@ -185,6 +188,38 @@ fn save_pasted_image(app: tauri::AppHandle, data_base64: String, mime: String) -
     fs::write(&file_path, &bytes).map_err(|e| e.to_string())?;
 
     Ok(file_path.to_string_lossy().replace('\\', "/"))
+}
+
+#[tauri::command]
+async fn save_clipboard_image(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
+        let image = match clipboard.get_image() {
+            Ok(image) => image,
+            Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let width = image.width as u32;
+        let height = image.height as u32;
+        let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, image.bytes.into_owned())
+            .ok_or_else(|| "Invalid clipboard image data".to_string())?;
+        let dynamic = DynamicImage::ImageRgba8(buffer);
+
+        let mut png_bytes = Cursor::new(Vec::new());
+        dynamic
+            .write_to(&mut png_bytes, ImageFormat::Png)
+            .map_err(|e| e.to_string())?;
+
+        let images_dir = staging_images_dir(&app)?;
+        let filename = unique_filename("png");
+        let file_path = images_dir.join(&filename);
+        fs::write(&file_path, png_bytes.into_inner()).map_err(|e| e.to_string())?;
+
+        Ok(Some(file_path.to_string_lossy().replace('\\', "/")))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ファイルを開くダイアログを出し、選ばれたファイルを読み込む
@@ -367,6 +402,7 @@ fn main() {
             save_file_to_path,
             save_file_dialog,
             save_pasted_image,
+            save_clipboard_image,
             export_html_dialog,
             read_text_file,
             write_draft,
