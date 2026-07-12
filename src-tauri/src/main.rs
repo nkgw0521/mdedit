@@ -134,14 +134,16 @@ fn migrate_pasted_images(
         };
         let dest_path = assets_dir.join(&filename);
 
-        if src_path.exists() {
-            if let Err(e) = fs::copy(&src_path, &dest_path) {
-                io_error = Some(e.to_string());
-                return caps[0].to_string();
-            }
-            // 移動が終わったので一時フォルダ側は削除しておく(ゴミを残さない)
-            let _ = fs::remove_file(&src_path);
+        if !src_path.exists() {
+            return caps[0].to_string();
         }
+
+        if let Err(e) = fs::copy(&src_path, &dest_path) {
+            io_error = Some(e.to_string());
+            return caps[0].to_string();
+        }
+        // 移動が終わったので一時フォルダ側は削除しておく(ゴミを残さない)
+        let _ = fs::remove_file(&src_path);
 
         format!(
             "![{}]({}/{})",
@@ -187,20 +189,32 @@ fn save_pasted_image(app: tauri::AppHandle, data_base64: String, mime: String) -
 
 // ファイルを開くダイアログを出し、選ばれたファイルを読み込む
 #[tauri::command]
-fn open_file_dialog(app: tauri::AppHandle) -> Result<Option<OpenedFile>, String> {
-    let picked = app
+async fn open_file_dialog(app: tauri::AppHandle) -> Result<Option<OpenedFile>, String> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app
         .dialog()
         .file()
         .add_filter("Markdown / Text", &["md", "markdown", "txt"])
         .add_filter("All Files", &["*"])
-        .blocking_pick_file();
+        .pick_file(move |picked| {
+            let _ = tx.blocking_send(picked);
+        });
+
+    let picked = rx
+        .recv()
+        .await
+        .ok_or_else(|| "File dialog was closed unexpectedly".to_string())?;
 
     let Some(file_path) = picked else {
         return Ok(None);
     };
 
     let path_buf: PathBuf = file_path.into_path().map_err(|e| e.to_string())?;
-    let content = fs::read_to_string(&path_buf).map_err(|e| e.to_string())?;
+    let content_path = path_buf.clone();
+    let content = tauri::async_runtime::spawn_blocking(move || fs::read_to_string(&content_path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
 
     Ok(Some(OpenedFile {
         path: path_buf.to_string_lossy().replace('\\', "/"),
@@ -210,31 +224,49 @@ fn open_file_dialog(app: tauri::AppHandle) -> Result<Option<OpenedFile>, String>
 
 // すでにパスが分かっているファイルへ上書き保存する(画像の移行込み)
 #[tauri::command]
-fn save_file_to_path(app: tauri::AppHandle, path: String, content: String) -> Result<String, String> {
-    let path_buf = PathBuf::from(&path);
-    let migrated = migrate_pasted_images(&app, &content, &path_buf)?;
-    fs::write(&path_buf, &migrated).map_err(|e| e.to_string())?;
-    Ok(migrated)
+async fn save_file_to_path(app: tauri::AppHandle, path: String, content: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path_buf = PathBuf::from(&path);
+        let migrated = migrate_pasted_images(&app, &content, &path_buf)?;
+        fs::write(&path_buf, &migrated).map_err(|e| e.to_string())?;
+        Ok(migrated)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // 「名前を付けて保存」ダイアログを出して保存する(画像の移行込み)
 #[tauri::command]
-fn save_file_dialog(app: tauri::AppHandle, content: String) -> Result<Option<SavedFile>, String> {
-    let picked = app
+async fn save_file_dialog(app: tauri::AppHandle, content: String) -> Result<Option<SavedFile>, String> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app
         .dialog()
         .file()
         .add_filter("Markdown", &["md"])
         .add_filter("Text", &["txt"])
         .set_file_name("untitled.md")
-        .blocking_save_file();
+        .save_file(move |picked| {
+            let _ = tx.blocking_send(picked);
+        });
+
+    let picked = rx
+        .recv()
+        .await
+        .ok_or_else(|| "File dialog was closed unexpectedly".to_string())?;
 
     let Some(file_path) = picked else {
         return Ok(None);
     };
 
     let path_buf: PathBuf = file_path.into_path().map_err(|e| e.to_string())?;
-    let migrated = migrate_pasted_images(&app, &content, &path_buf)?;
-    fs::write(&path_buf, &migrated).map_err(|e| e.to_string())?;
+    let saved_path = path_buf.clone();
+    let migrated = tauri::async_runtime::spawn_blocking(move || {
+        let migrated = migrate_pasted_images(&app, &content, &saved_path)?;
+        fs::write(&saved_path, &migrated).map_err(|e| e.to_string())?;
+        Ok::<String, String>(migrated)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     Ok(Some(SavedFile {
         path: path_buf.to_string_lossy().replace('\\', "/"),
@@ -244,24 +276,36 @@ fn save_file_dialog(app: tauri::AppHandle, content: String) -> Result<Option<Sav
 
 // HTMLとしてエクスポートする(画像は既にbase64で埋め込まれた自己完結な内容を渡す想定)
 #[tauri::command]
-fn export_html_dialog(
+async fn export_html_dialog(
     app: tauri::AppHandle,
     content: String,
     default_name: String,
 ) -> Result<Option<String>, String> {
-    let picked = app
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app
         .dialog()
         .file()
         .add_filter("HTML", &["html", "htm"])
         .set_file_name(&default_name)
-        .blocking_save_file();
+        .save_file(move |picked| {
+            let _ = tx.blocking_send(picked);
+        });
+
+    let picked = rx
+        .recv()
+        .await
+        .ok_or_else(|| "File dialog was closed unexpectedly".to_string())?;
 
     let Some(file_path) = picked else {
         return Ok(None);
     };
 
     let path_buf: PathBuf = file_path.into_path().map_err(|e| e.to_string())?;
-    fs::write(&path_buf, content).map_err(|e| e.to_string())?;
+    let export_path = path_buf.clone();
+    tauri::async_runtime::spawn_blocking(move || fs::write(&export_path, content))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
 
     Ok(Some(path_buf.to_string_lossy().to_string()))
 }

@@ -403,26 +403,39 @@ async function doOpen() {
 }
 
 // ---- 「保存」/「名前を付けて保存」(アクティブなタブが対象) ----
+let saveInProgress = false;
+
 async function doSave() {
   const tab = activeTab();
   if (!tab) return;
+  if (saveInProgress) return;
   if (!tab.path) {
     return doSaveAs();
   }
+  saveInProgress = true;
+  statusBar.textContent = `Saving: ${tab.path}`;
   try {
+    const contentBeforeSave = tab.content;
     const migratedContent = await window.__TAURI__.core.invoke("save_file_to_path", {
       path: tab.path,
       content: tab.content
     });
     tab.content = migratedContent;
     tab.dirty = false;
-    editor.value = tab.content;
     await deleteDraftForTab(tab);
     renderTabBar();
-    updateStatusBar();
-    render();
+    if (tab === activeTab()) {
+      editor.value = tab.content;
+      updateStatusBar();
+      if (migratedContent !== contentBeforeSave) {
+        render();
+      }
+    }
   } catch (err) {
     alert("Failed to save file: " + err);
+  } finally {
+    saveInProgress = false;
+    updateStatusBar();
   }
 }
 
@@ -584,6 +597,13 @@ function exportBaseName() {
   return fileName.replace(/\.[^.]+$/, "") || "untitled";
 }
 
+function escapeHtmlText(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 async function buildExportContainer() {
   const container = document.createElement("div");
   container.innerHTML = preview.innerHTML;
@@ -617,7 +637,7 @@ async function doExportHtml() {
       '<html lang="en">\n' +
       "<head>\n" +
       '<meta charset="UTF-8">\n' +
-      `<title>${title}</title>\n` +
+      `<title>${escapeHtmlText(title)}</title>\n` +
       `<style>${exportDocumentCss()}</style>\n` +
       "</head>\n" +
       "<body>\n" +
@@ -801,8 +821,8 @@ window.addEventListener("load", async () => {
   // ことで、次回起動時に元通り復元できるようにする。
   //
   // 参考(1次情報): https://v2.tauri.app/reference/javascript/api/namespacewindow/
-  // ここでは event.preventDefault() を呼ばないので、この処理が終わった後は
-  // 通常通りウィンドウが閉じる(先に確認したTauri公式ドキュメントの挙動)。
+  // event.preventDefault() で通常のcloseを一度止め、セッション保存が終わってから
+  // destroy() で明示的に閉じる。
   // ---------------------------------------------------------------
   async function saveSessionForExit() {
     const current = activeTab();
@@ -838,7 +858,8 @@ window.addEventListener("load", async () => {
     const { getCurrentWindow } = window.__TAURI__.window;
     const currentWindow = getCurrentWindow();
 
-    await currentWindow.onCloseRequested(async () => {
+    await currentWindow.onCloseRequested(async (event) => {
+      event.preventDefault();
       console.log("[mdedit] close-requested handler fired");
       // 何らかの理由でセッション保存処理が失敗/ハングしても、
       // ウィンドウが二度と閉じられなくなる事態だけは避けたいので、
