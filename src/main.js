@@ -403,39 +403,26 @@ async function doOpen() {
 }
 
 // ---- 「保存」/「名前を付けて保存」(アクティブなタブが対象) ----
-let saveInProgress = false;
-
 async function doSave() {
   const tab = activeTab();
   if (!tab) return;
-  if (saveInProgress) return;
   if (!tab.path) {
     return doSaveAs();
   }
-  saveInProgress = true;
-  statusBar.textContent = `Saving: ${tab.path}`;
   try {
-    const contentBeforeSave = tab.content;
     const migratedContent = await window.__TAURI__.core.invoke("save_file_to_path", {
       path: tab.path,
       content: tab.content
     });
     tab.content = migratedContent;
     tab.dirty = false;
+    editor.value = tab.content;
     await deleteDraftForTab(tab);
     renderTabBar();
-    if (tab === activeTab()) {
-      editor.value = tab.content;
-      updateStatusBar();
-      if (migratedContent !== contentBeforeSave) {
-        render();
-      }
-    }
+    updateStatusBar();
+    render();
   } catch (err) {
     alert("Failed to save file: " + err);
-  } finally {
-    saveInProgress = false;
-    updateStatusBar();
   }
 }
 
@@ -559,38 +546,6 @@ function insertAtCursor(textarea, text) {
   textarea.selectionStart = textarea.selectionEnd = cursor;
 }
 
-function markEditorInsertion(text) {
-  const tab = activeTab();
-  if (tab) {
-    pushUndoSnapshot(tab);
-  }
-  insertAtCursor(editor, text);
-  if (tab) {
-    tab.content = editor.value;
-    tab.dirty = true;
-  }
-  renderTabBar();
-  updateStatusBar();
-  render();
-}
-
-function withMarkdownBlockSpacing(text) {
-  const before = editor.value.slice(0, editor.selectionStart);
-  const after = editor.value.slice(editor.selectionEnd);
-
-  let prefix = "";
-  if (before.length > 0 && !before.endsWith("\n\n")) {
-    prefix = before.endsWith("\n") ? "\n" : "\n\n";
-  }
-
-  let suffix = "";
-  if (after.length > 0 && !after.startsWith("\n")) {
-    suffix = "\n";
-  }
-
-  return prefix + text + suffix;
-}
-
 function blobToDataUrl(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -629,13 +584,6 @@ function exportBaseName() {
   return fileName.replace(/\.[^.]+$/, "") || "untitled";
 }
 
-function escapeHtmlText(text) {
-  return String(text)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
 async function buildExportContainer() {
   const container = document.createElement("div");
   container.innerHTML = preview.innerHTML;
@@ -660,132 +608,6 @@ function exportDocumentCss() {
   `;
 }
 
-function normalizeTableCellText(text) {
-  return text.replace(/\s+/g, " ").trim();
-}
-
-function escapeMarkdownTableCell(text) {
-  return normalizeTableCellText(text)
-    .replace(/\\/g, "\\\\")
-    .replace(/\|/g, "\\|");
-}
-
-function normalizeTableRows(rows) {
-  const nonEmptyRows = rows.filter((row) => row.some((cell) => normalizeTableCellText(cell) !== ""));
-  if (nonEmptyRows.length === 0) return [];
-
-  const columnCount = Math.max(...nonEmptyRows.map((row) => row.length));
-  return nonEmptyRows.map((row) => {
-    const normalized = row.slice(0, columnCount);
-    while (normalized.length < columnCount) normalized.push("");
-    return normalized;
-  });
-}
-
-function rowsToMarkdownTable(rows) {
-  const normalizedRows = normalizeTableRows(rows);
-  if (normalizedRows.length === 0 || normalizedRows[0].length === 0) return null;
-
-  const header = normalizedRows[0].map(escapeMarkdownTableCell);
-  const separator = normalizedRows[0].map(() => "---");
-  const body = normalizedRows.slice(1).map((row) => row.map(escapeMarkdownTableCell));
-  const tableRows = [header, separator, ...body];
-
-  return tableRows.map((row) => `| ${row.join(" | ")} |`).join("\n") + "\n";
-}
-
-function htmlTableToMarkdown(html) {
-  if (!html || !/<table[\s>]/i.test(html)) return null;
-
-  const doc = new DOMParser().parseFromString(html, "text/html");
-  const table = doc.querySelector("table");
-  if (!table) return null;
-
-  const rows = Array.from(table.querySelectorAll("tr")).map((tr) =>
-    Array.from(tr.querySelectorAll("th, td")).map((cell) => cell.textContent || "")
-  );
-
-  return rowsToMarkdownTable(rows);
-}
-
-function tsvToMarkdownTable(text) {
-  if (!text || !text.includes("\t")) return null;
-
-  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-  const rows = lines.map((line) => line.split("\t"));
-
-  return rowsToMarkdownTable(rows);
-}
-
-function clipboardTableToMarkdown(clipboardData) {
-  if (!clipboardData) return null;
-  return htmlTableToMarkdown(clipboardData.getData("text/html")) ||
-    tsvToMarkdownTable(clipboardData.getData("text/plain"));
-}
-
-function clipboardImageFile(clipboardData) {
-  if (!clipboardData) return null;
-
-  const items = clipboardData.items || [];
-  for (const item of items) {
-    if (!item.type.startsWith("image/")) continue;
-    const file = item.getAsFile();
-    if (file) return file;
-  }
-
-  const files = clipboardData.files || [];
-  for (const file of files) {
-    if (file.type && file.type.startsWith("image/")) return file;
-  }
-
-  return null;
-}
-
-async function navigatorClipboardImageBlob() {
-  if (!navigator.clipboard || !navigator.clipboard.read) return null;
-
-  try {
-    const clipboardItems = await navigator.clipboard.read();
-    for (const clipboardItem of clipboardItems) {
-      const imageType = clipboardItem.types.find((type) => type.startsWith("image/"));
-      if (imageType) {
-        return await clipboardItem.getType(imageType);
-      }
-    }
-  } catch (err) {
-    console.warn("Failed to read image from navigator.clipboard:", err);
-  }
-
-  return null;
-}
-
-async function pasteImageBlob(blob) {
-  const dataUrl = await blobToDataUrl(blob);
-  const match = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
-  if (!match) {
-    throw new Error("Unsupported image data");
-  }
-  const [, mime, base64Data] = match;
-
-  const { invoke } = window.__TAURI__.core;
-  const path = await invoke("save_pasted_image", { dataBase64: base64Data, mime });
-  markEditorInsertion(`![](${path})\n`);
-}
-
-async function pasteNativeClipboardImage() {
-  try {
-    const { invoke } = window.__TAURI__.core;
-    const path = await invoke("save_clipboard_image");
-    if (!path) return false;
-    markEditorInsertion(`![](${path})\n`);
-    return true;
-  } catch (err) {
-    console.warn("Failed to read native clipboard image:", err);
-    return false;
-  }
-}
-
 async function doExportHtml() {
   try {
     const container = await buildExportContainer();
@@ -795,7 +617,7 @@ async function doExportHtml() {
       '<html lang="en">\n' +
       "<head>\n" +
       '<meta charset="UTF-8">\n' +
-      `<title>${escapeHtmlText(title)}</title>\n` +
+      `<title>${title}</title>\n` +
       `<style>${exportDocumentCss()}</style>\n` +
       "</head>\n" +
       "<body>\n" +
@@ -862,41 +684,39 @@ editor.addEventListener("input", () => {
 // invoke("save_pasted_image", ...) でファイルとして保存し、
 // 本文には ![](パス) だけを挿入する。
 editor.addEventListener("paste", async (e) => {
-  const imageFile = clipboardImageFile(e.clipboardData);
-  if (imageFile) {
-    e.preventDefault();
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
 
-    try {
-      await pasteImageBlob(imageFile);
-    } catch (err) {
-      alert("Failed to save image: " + err);
+  for (const item of items) {
+    if (item.type.startsWith("image/")) {
+      e.preventDefault();
+
+      const blob = item.getAsFile();
+      const dataUrl = await blobToDataUrl(blob);
+      const match = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
+      if (!match) continue;
+      const [, mime, base64Data] = match;
+
+      try {
+        const { invoke } = window.__TAURI__.core;
+        const path = await invoke("save_pasted_image", { dataBase64: base64Data, mime });
+        const tab = activeTab();
+        if (tab) {
+          pushUndoSnapshot(tab);
+        }
+        insertAtCursor(editor, `![](${path})\n`);
+        if (tab) {
+          tab.content = editor.value;
+          tab.dirty = true;
+        }
+        renderTabBar();
+        updateStatusBar();
+        render();
+      } catch (err) {
+        alert("Failed to save image: " + err);
+      }
+      break; // 1回の貼り付けで複数画像が来た場合は、今回は先頭の1枚のみ対応
     }
-    return; // 1回の貼り付けで複数画像が来た場合は、今回は先頭の1枚のみ対応
-  }
-
-  const markdownTable = clipboardTableToMarkdown(e.clipboardData);
-  if (markdownTable) {
-    e.preventDefault();
-    markEditorInsertion(withMarkdownBlockSpacing(markdownTable));
-    return;
-  }
-
-  const plainText = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
-  e.preventDefault();
-
-  if (await pasteNativeClipboardImage()) {
-    return;
-  }
-
-  const navigatorImage = await navigatorClipboardImageBlob();
-  if (navigatorImage) {
-    try {
-      await pasteImageBlob(navigatorImage);
-    } catch (err) {
-      alert("Failed to save image: " + err);
-    }
-  } else if (plainText) {
-    markEditorInsertion(plainText);
   }
 });
 
@@ -981,8 +801,8 @@ window.addEventListener("load", async () => {
   // ことで、次回起動時に元通り復元できるようにする。
   //
   // 参考(1次情報): https://v2.tauri.app/reference/javascript/api/namespacewindow/
-  // event.preventDefault() で通常のcloseを一度止め、セッション保存が終わってから
-  // destroy() で明示的に閉じる。
+  // ここでは event.preventDefault() を呼ばないので、この処理が終わった後は
+  // 通常通りウィンドウが閉じる(先に確認したTauri公式ドキュメントの挙動)。
   // ---------------------------------------------------------------
   async function saveSessionForExit() {
     const current = activeTab();
@@ -1018,8 +838,7 @@ window.addEventListener("load", async () => {
     const { getCurrentWindow } = window.__TAURI__.window;
     const currentWindow = getCurrentWindow();
 
-    await currentWindow.onCloseRequested(async (event) => {
-      event.preventDefault();
+    await currentWindow.onCloseRequested(async () => {
       console.log("[mdedit] close-requested handler fired");
       // 何らかの理由でセッション保存処理が失敗/ハングしても、
       // ウィンドウが二度と閉じられなくなる事態だけは避けたいので、

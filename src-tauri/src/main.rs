@@ -16,13 +16,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arboard::Clipboard;
 use base64::{engine::general_purpose, Engine as _};
-use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 use regex::Regex;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Emitter, Manager};
@@ -137,16 +134,14 @@ fn migrate_pasted_images(
         };
         let dest_path = assets_dir.join(&filename);
 
-        if !src_path.exists() {
-            return caps[0].to_string();
+        if src_path.exists() {
+            if let Err(e) = fs::copy(&src_path, &dest_path) {
+                io_error = Some(e.to_string());
+                return caps[0].to_string();
+            }
+            // 移動が終わったので一時フォルダ側は削除しておく(ゴミを残さない)
+            let _ = fs::remove_file(&src_path);
         }
-
-        if let Err(e) = fs::copy(&src_path, &dest_path) {
-            io_error = Some(e.to_string());
-            return caps[0].to_string();
-        }
-        // 移動が終わったので一時フォルダ側は削除しておく(ゴミを残さない)
-        let _ = fs::remove_file(&src_path);
 
         format!(
             "![{}]({}/{})",
@@ -190,66 +185,22 @@ fn save_pasted_image(app: tauri::AppHandle, data_base64: String, mime: String) -
     Ok(file_path.to_string_lossy().replace('\\', "/"))
 }
 
-#[tauri::command]
-async fn save_clipboard_image(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
-        let image = match clipboard.get_image() {
-            Ok(image) => image,
-            Err(arboard::Error::ContentNotAvailable) => return Ok(None),
-            Err(e) => return Err(e.to_string()),
-        };
-
-        let width = image.width as u32;
-        let height = image.height as u32;
-        let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, image.bytes.into_owned())
-            .ok_or_else(|| "Invalid clipboard image data".to_string())?;
-        let dynamic = DynamicImage::ImageRgba8(buffer);
-
-        let mut png_bytes = Cursor::new(Vec::new());
-        dynamic
-            .write_to(&mut png_bytes, ImageFormat::Png)
-            .map_err(|e| e.to_string())?;
-
-        let images_dir = staging_images_dir(&app)?;
-        let filename = unique_filename("png");
-        let file_path = images_dir.join(&filename);
-        fs::write(&file_path, png_bytes.into_inner()).map_err(|e| e.to_string())?;
-
-        Ok(Some(file_path.to_string_lossy().replace('\\', "/")))
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 // ファイルを開くダイアログを出し、選ばれたファイルを読み込む
 #[tauri::command]
-async fn open_file_dialog(app: tauri::AppHandle) -> Result<Option<OpenedFile>, String> {
-    let (tx, mut rx) = tauri::async_runtime::channel(1);
-    app
+fn open_file_dialog(app: tauri::AppHandle) -> Result<Option<OpenedFile>, String> {
+    let picked = app
         .dialog()
         .file()
         .add_filter("Markdown / Text", &["md", "markdown", "txt"])
         .add_filter("All Files", &["*"])
-        .pick_file(move |picked| {
-            let _ = tx.blocking_send(picked);
-        });
-
-    let picked = rx
-        .recv()
-        .await
-        .ok_or_else(|| "File dialog was closed unexpectedly".to_string())?;
+        .blocking_pick_file();
 
     let Some(file_path) = picked else {
         return Ok(None);
     };
 
     let path_buf: PathBuf = file_path.into_path().map_err(|e| e.to_string())?;
-    let content_path = path_buf.clone();
-    let content = tauri::async_runtime::spawn_blocking(move || fs::read_to_string(&content_path))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+    let content = fs::read_to_string(&path_buf).map_err(|e| e.to_string())?;
 
     Ok(Some(OpenedFile {
         path: path_buf.to_string_lossy().replace('\\', "/"),
@@ -259,49 +210,31 @@ async fn open_file_dialog(app: tauri::AppHandle) -> Result<Option<OpenedFile>, S
 
 // すでにパスが分かっているファイルへ上書き保存する(画像の移行込み)
 #[tauri::command]
-async fn save_file_to_path(app: tauri::AppHandle, path: String, content: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let path_buf = PathBuf::from(&path);
-        let migrated = migrate_pasted_images(&app, &content, &path_buf)?;
-        fs::write(&path_buf, &migrated).map_err(|e| e.to_string())?;
-        Ok(migrated)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+fn save_file_to_path(app: tauri::AppHandle, path: String, content: String) -> Result<String, String> {
+    let path_buf = PathBuf::from(&path);
+    let migrated = migrate_pasted_images(&app, &content, &path_buf)?;
+    fs::write(&path_buf, &migrated).map_err(|e| e.to_string())?;
+    Ok(migrated)
 }
 
 // 「名前を付けて保存」ダイアログを出して保存する(画像の移行込み)
 #[tauri::command]
-async fn save_file_dialog(app: tauri::AppHandle, content: String) -> Result<Option<SavedFile>, String> {
-    let (tx, mut rx) = tauri::async_runtime::channel(1);
-    app
+fn save_file_dialog(app: tauri::AppHandle, content: String) -> Result<Option<SavedFile>, String> {
+    let picked = app
         .dialog()
         .file()
         .add_filter("Markdown", &["md"])
         .add_filter("Text", &["txt"])
         .set_file_name("untitled.md")
-        .save_file(move |picked| {
-            let _ = tx.blocking_send(picked);
-        });
-
-    let picked = rx
-        .recv()
-        .await
-        .ok_or_else(|| "File dialog was closed unexpectedly".to_string())?;
+        .blocking_save_file();
 
     let Some(file_path) = picked else {
         return Ok(None);
     };
 
     let path_buf: PathBuf = file_path.into_path().map_err(|e| e.to_string())?;
-    let saved_path = path_buf.clone();
-    let migrated = tauri::async_runtime::spawn_blocking(move || {
-        let migrated = migrate_pasted_images(&app, &content, &saved_path)?;
-        fs::write(&saved_path, &migrated).map_err(|e| e.to_string())?;
-        Ok::<String, String>(migrated)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let migrated = migrate_pasted_images(&app, &content, &path_buf)?;
+    fs::write(&path_buf, &migrated).map_err(|e| e.to_string())?;
 
     Ok(Some(SavedFile {
         path: path_buf.to_string_lossy().replace('\\', "/"),
@@ -311,36 +244,24 @@ async fn save_file_dialog(app: tauri::AppHandle, content: String) -> Result<Opti
 
 // HTMLとしてエクスポートする(画像は既にbase64で埋め込まれた自己完結な内容を渡す想定)
 #[tauri::command]
-async fn export_html_dialog(
+fn export_html_dialog(
     app: tauri::AppHandle,
     content: String,
     default_name: String,
 ) -> Result<Option<String>, String> {
-    let (tx, mut rx) = tauri::async_runtime::channel(1);
-    app
+    let picked = app
         .dialog()
         .file()
         .add_filter("HTML", &["html", "htm"])
         .set_file_name(&default_name)
-        .save_file(move |picked| {
-            let _ = tx.blocking_send(picked);
-        });
-
-    let picked = rx
-        .recv()
-        .await
-        .ok_or_else(|| "File dialog was closed unexpectedly".to_string())?;
+        .blocking_save_file();
 
     let Some(file_path) = picked else {
         return Ok(None);
     };
 
     let path_buf: PathBuf = file_path.into_path().map_err(|e| e.to_string())?;
-    let export_path = path_buf.clone();
-    tauri::async_runtime::spawn_blocking(move || fs::write(&export_path, content))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+    fs::write(&path_buf, content).map_err(|e| e.to_string())?;
 
     Ok(Some(path_buf.to_string_lossy().to_string()))
 }
@@ -402,7 +323,6 @@ fn main() {
             save_file_to_path,
             save_file_dialog,
             save_pasted_image,
-            save_clipboard_image,
             export_html_dialog,
             read_text_file,
             write_draft,
