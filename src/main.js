@@ -605,6 +605,9 @@ function exportDocumentCss() {
     pre { background: #f5f5f5; padding: 10px; overflow-x: auto; }
     code { background: #f5f5f5; padding: 2px 4px; }
     blockquote { border-left: 4px solid #ccc; margin: 0; padding-left: 12px; color: #555; }
+    table { border-collapse: collapse; margin: 12px 0; }
+    th, td { border: 1px solid #ccc; padding: 6px 10px; }
+    th { background: #f5f5f5; font-weight: 600; }
   `;
 }
 

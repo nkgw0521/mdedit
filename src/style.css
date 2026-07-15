@@ -155,19 +155,42 @@ body.split-resizing {
   line-height: 1.7;
 }
 
-.preview-body img {
+.preview-body img,
+.print-only img {
   max-width: 100%;
 }
 
-.preview-body pre {
+.preview-body pre,
+.print-only pre {
   background: #f5f5f5;
   padding: 10px;
   overflow-x: auto;
 }
 
-.preview-body code {
+.preview-body code,
+.print-only code {
   background: #f5f5f5;
   padding: 2px 4px;
+}
+
+.preview-body table,
+.print-only table {
+  border-collapse: collapse;
+  margin: 12px 0;
+}
+
+.preview-body th,
+.preview-body td,
+.print-only th,
+.print-only td {
+  border: 1px solid #ccc;
+  padding: 6px 10px;
+}
+
+.preview-body th,
+.print-only th {
+  background: #f5f5f5;
+  font-weight: 600;
 }
 
 .mermaid-diagram {
