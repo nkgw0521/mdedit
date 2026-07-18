@@ -4,8 +4,9 @@
 // 3. 貼り付けられた画像を ~/.mdedit/images に一時保存する
 // 4. 保存時に、その一時保存した画像を文書と同じ場所へ移し、
 //    Markdown本文のリンクを相対パスに書き換える(ポータビリティ確保)
-// 5. 複数タブのセッション情報(~/.mdedit/session.json)と、
-//    未保存タブの下書き(~/.mdedit/drafts/)の読み書き
+// 6. Windows/Linuxで、Explorer等から.mdファイルをダブルクリックして
+//    起動した(または既に起動中のアプリに別のファイルを渡した)ときに、
+//    そのファイルを開く
 //
 // 参考(1次情報):
 // - メニュー: https://v2.tauri.app/learn/window-menu/
@@ -13,10 +14,15 @@
 // - asset protocol: https://v2.tauri.app/security/asset-protocol/
 // - path API (home_dir): https://v2.tauri.app/reference/javascript/api/namespacepath/
 // - ウィンドウを閉じる前の処理: https://v2.tauri.app/reference/javascript/api/namespacewindow/
+// - RunEvent::Opened(ファイルを開いて起動する仕組み)はWindows/Linuxでは
+//   使えず、macOS/iOS/Androidのみ対応とのこと。Windows/Linuxではコマンド
+//   ライン引数から自前でファイルパスを取り出す必要がある。
+//   参考: https://v2.tauri.app/learn/mobile-file-associations/
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose, Engine as _};
@@ -24,6 +30,21 @@ use regex::Regex;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
+
+// 起動時にファイルを開く要求があった場合、フロントの準備ができるまで
+// 一時的にファイルパスを保持しておくための状態
+struct LaunchFiles(Mutex<Vec<String>>);
+
+// コマンドライン引数から「開くべきファイルのパス」らしきものだけを取り出す。
+// argv[0](実行ファイル自身のパス)や、`--`で始まるオプション引数は除外し、
+// 実在するファイルだけを対象にする。
+fn extract_file_args(args: Vec<String>) -> Vec<String> {
+    args.into_iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .filter(|a| Path::new(a).is_file())
+        .collect()
+}
 
 // ---------------------------------------------------------------
 // 型定義
@@ -315,8 +336,36 @@ fn load_session(app: tauri::AppHandle) -> Result<Option<String>, String> {
     Ok(Some(content))
 }
 
+// 起動時にExplorer等から渡されたファイル(あれば)を取り出す。
+// フロントが起動処理の中で1回だけ呼ぶことを想定しており、
+// 呼ばれた後は空になる(2回目以降は何も返らない)。
+#[tauri::command]
+fn take_launch_files(state: tauri::State<LaunchFiles>) -> Vec<String> {
+    let mut files = state.0.lock().unwrap();
+    std::mem::take(&mut *files)
+}
+
 fn main() {
+    // 起動時にファイルを開く要求があれば(Explorer等からのダブルクリック)、
+    // ここで一旦保持しておき、フロントの準備ができてから渡す。
+    let initial_launch_files = extract_file_args(std::env::args().collect());
+
     tauri::Builder::default()
+        // 2重起動防止プラグインは、必ず一番最初に登録する必要がある
+        // (公式ドキュメントの指示)。既に起動中のインスタンスがある状態で
+        // 別の.mdファイルをダブルクリックした場合、新しいプロセスは
+        // すぐに終了し、この後の処理はすべて既存のウィンドウ側で動く。
+        // 参考(1次情報): https://v2.tauri.app/plugin/single-instance/
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            let files = extract_file_args(argv);
+            if !files.is_empty() {
+                let _ = app.emit("open-files", files);
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+        }))
+        .manage(LaunchFiles(Mutex::new(initial_launch_files)))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             open_file_dialog,
@@ -328,7 +377,8 @@ fn main() {
             write_draft,
             delete_draft,
             save_session,
-            load_session
+            load_session,
+            take_launch_files
         ])
         .setup(|app| {
             // ---- "File" menu ----

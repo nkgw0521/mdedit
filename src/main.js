@@ -377,26 +377,45 @@ function doNew() {
   render();
 }
 
+// ---- 指定したパスのファイル(複数可)を開く。既に同じパスのタブが
+//      あればそちらへ切り替える。Explorer等からのファイル起動、および
+//      「開く」ダイアログの両方から使う共通処理。 ----
+async function openFilesFromPaths(paths) {
+  let lastOpenedIndex = null;
+
+  for (const rawPath of paths) {
+    const normalizedPath = normalizePath(rawPath);
+    const existingIndex = tabs.findIndex((t) => t.path === normalizedPath);
+    if (existingIndex !== -1) {
+      lastOpenedIndex = existingIndex;
+      continue;
+    }
+
+    try {
+      const content = await window.__TAURI__.core.invoke("read_text_file", { path: rawPath });
+      createTab({ path: normalizedPath, content, dirty: false });
+      lastOpenedIndex = tabs.length - 1;
+    } catch (err) {
+      alert("Failed to open file: " + rawPath + "\n" + err);
+    }
+  }
+
+  if (lastOpenedIndex !== null) {
+    activeIndex = lastOpenedIndex;
+    editor.value = activeTab().content;
+    renderTabBar();
+    updateStatusBar();
+    render();
+  }
+}
+
 // ---- 「開く」: すでに同じパスのタブが開いていればそこへ切り替え、
 //      無ければ新しいタブを作って読み込む ----
 async function doOpen() {
   try {
     const result = await window.__TAURI__.core.invoke("open_file_dialog");
     if (!result) return;
-    const normalizedPath = normalizePath(result.path);
-
-    const existingIndex = tabs.findIndex((t) => t.path === normalizedPath);
-    if (existingIndex !== -1) {
-      switchToTab(existingIndex);
-      return;
-    }
-
-    createTab({ path: normalizedPath, content: result.content, dirty: false });
-    activeIndex = tabs.length - 1;
-    editor.value = result.content;
-    renderTabBar();
-    updateStatusBar();
-    render();
+    await openFilesFromPaths([result.path]);
   } catch (err) {
     alert("Failed to open file: " + err);
   }
@@ -738,6 +757,22 @@ window.addEventListener("load", async () => {
   renderTabBar();
   updateStatusBar();
   await render();
+
+  // Explorer等からファイルをダブルクリックして起動した場合、その
+  // ファイルパスをRust側で一時的に保持しているので、ここで取り出して開く。
+  // (セッション復元より後に行うことで、タブとして追加される)
+  try {
+    const launchFiles = await invoke("take_launch_files");
+    if (launchFiles && launchFiles.length > 0) {
+      await openFilesFromPaths(launchFiles);
+    }
+  } catch (err) {
+    console.error("Failed to open launch files:", err);
+  }
+
+  // アプリが既に起動している状態で、別の.mdファイルをダブルクリック
+  // した場合はこちらに届く(Rust側の2重起動防止プラグイン経由)
+  listen("open-files", (event) => openFilesFromPaths(event.payload));
 
   listen("menu-new", () => doNew());
   listen("menu-open", () => doOpen());
