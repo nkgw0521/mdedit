@@ -55,6 +55,10 @@ md.renderer.rules.fence = (tokens, idx, options, env, self) => {
 //
 // パスの解決は「今アクティブなタブの保存先」を基準にするため、
 // activeTab() を参照する(タブ機能に対応)。
+//
+// また、altテキストの末尾に "|300" や "|300x200" と書くと、
+// 画像の表示サイズを指定できるようにしている(このアプリ独自の記法)。
+// 例: ![|300](path) や ![screenshot|300x200](path)
 // ---------------------------------------------------------------
 const defaultImageRenderer =
   md.renderer.rules.image ||
@@ -68,6 +72,34 @@ md.renderer.rules.image = (tokens, idx, options, env, self) => {
   if (srcIdx >= 0) {
     token.attrs[srcIdx][1] = resolveImageSrc(token.attrs[srcIdx][1]);
   }
+
+  // alt テキストの末尾の "|300" や "|300x200" を、サイズ指定として解釈する
+  const altText = self.renderInlineAsText(token.children, options, env);
+  const sizeMatch = altText.match(/\|\s*(\d+)?\s*(?:x\s*(\d+))?\s*$/);
+
+  if (sizeMatch && (sizeMatch[1] || sizeMatch[2])) {
+    const width = sizeMatch[1];
+    const height = sizeMatch[2];
+
+    if (width) {
+      const widthIdx = token.attrIndex("width");
+      if (widthIdx < 0) token.attrPush(["width", width]);
+      else token.attrs[widthIdx][1] = width;
+    }
+    if (height) {
+      const heightIdx = token.attrIndex("height");
+      if (heightIdx < 0) token.attrPush(["height", height]);
+      else token.attrs[heightIdx][1] = height;
+    }
+
+    // 既定のレンダラーはaltをtoken.childrenから再計算してしまうため、
+    // 単純な(書式無しの)altテキストの場合に限り、サイズ指定部分を
+    // 本文(children)側からも取り除いておく。
+    if (token.children && token.children.length === 1 && token.children[0].type === "text") {
+      token.children[0].content = altText.slice(0, sizeMatch.index).trim();
+    }
+  }
+
   return defaultImageRenderer(tokens, idx, options, env, self);
 };
 
@@ -162,7 +194,9 @@ let activeIndex = -1;
 const SAMPLE_CONTENT =
   "# Sample\n\nType **Markdown** here and the preview will show up on the right.\n\n" +
   "- List item 1\n- List item 2\n\n> Blockquotes are supported too.\n\n" +
-  "You can paste screenshots and other images directly into this text area (Ctrl+V).\n\n" +
+  "You can paste screenshots and other images directly into this text area (Ctrl+V).\n" +
+  "Add `|300` to the alt text to control the display size, e.g. `![|300](path)`.\n" +
+  "You can also paste a cell range copied from Excel and it will become a Markdown table.\n\n" +
   "## Mermaid example\n\n```mermaid\nflowchart LR\n    A[Start] --> B{Condition}\n" +
   "    B -->|Yes| C[Step A]\n    B -->|No| D[Step B]\n    C --> E[End]\n    D --> E\n```\n";
 
@@ -701,45 +735,145 @@ editor.addEventListener("input", () => {
   renderDebounceTimer = setTimeout(render, 250);
 });
 
-// ---- 画像の貼り付け ----
+// ---------------------------------------------------------------
+// 表(Excel等からのコピー)をMarkdownの表として貼り付ける
+//
+// Excelでセル範囲をコピーすると、クリップボードには
+// - text/html: <table>形式のHTML
+// - text/plain: タブ区切りのテキスト(TSV)
+// の両方が入る。text/htmlがあればそちらを優先し(結合セル崩れが
+// 少ないため)、無ければtext/plainのタブ区切りから組み立てる。
+// Webページの表をコピーした場合も、同じtext/htmlの仕組みで動く。
+// ---------------------------------------------------------------
+
+// 行×列の配列(文字列の二次元配列)からMarkdownの表を組み立てる共通処理
+function cellsToMarkdownTable(rows) {
+  if (rows.length === 0) return null;
+  const colCount = Math.max(...rows.map((r) => r.length));
+  if (colCount < 2) return null; // 1列だけならテーブル化する意味が薄いので対象外
+
+  const normalized = rows.map((r) => {
+    const copy = r.slice();
+    while (copy.length < colCount) copy.push("");
+    return copy;
+  });
+
+  const escapeCell = (s) => s.replace(/\s+/g, " ").trim().replace(/\|/g, "\\|");
+  const header = normalized[0].map(escapeCell);
+  const body = normalized.slice(1).map((row) => row.map(escapeCell));
+
+  const lines = [];
+  lines.push("| " + header.join(" | ") + " |");
+  lines.push("| " + header.map(() => "---").join(" | ") + " |");
+  for (const row of body) {
+    lines.push("| " + row.join(" | ") + " |");
+  }
+  return lines.join("\n") + "\n";
+}
+
+// クリップボードのtext/html(<table>を含む想定)からMarkdownの表を作る
+function htmlToMarkdownTable(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const table = doc.querySelector("table");
+  if (!table) return null;
+
+  const rows = Array.from(table.querySelectorAll("tr"))
+    .map((tr) => Array.from(tr.querySelectorAll("th,td")).map((cell) => cell.textContent))
+    .filter((row) => row.length > 0);
+
+  return cellsToMarkdownTable(rows);
+}
+
+// クリップボードのtext/plain(タブ区切り)からMarkdownの表を作る
+// (text/htmlが無い環境や、他アプリからのコピー向けのフォールバック)
+function tsvToMarkdownTable(text) {
+  const lines = text.replace(/\r\n/g, "\n").split("\n").filter((l) => l.length > 0);
+  if (!lines.some((l) => l.includes("\t"))) return null; // タブが無ければ表とはみなさない
+
+  const rows = lines.map((l) => l.split("\t"));
+  return cellsToMarkdownTable(rows);
+}
+
+// 変換したMarkdownの表を、Undo履歴に積んでからカーソル位置に挿入する
+function insertMarkdownTable(markdownTable) {
+  const tab = activeTab();
+  if (tab) pushUndoSnapshot(tab);
+  insertAtCursor(editor, markdownTable);
+  if (tab) {
+    tab.content = editor.value;
+    tab.dirty = true;
+  }
+  renderTabBar();
+  updateStatusBar();
+  render();
+}
+
+// ---- 画像・表の貼り付け ----
 // クリップボードに画像が入っている場合はテキストとしてではなく、
 // invoke("save_pasted_image", ...) でファイルとして保存し、
 // 本文には ![](パス) だけを挿入する。
+// 画像で無ければ、Excel等からの表データかどうかを調べ、表であれば
+// Markdownの表に変換して挿入する。どちらでもなければ通常のテキスト
+// 貼り付けに任せる(何もしない)。
 editor.addEventListener("paste", async (e) => {
-  const items = e.clipboardData && e.clipboardData.items;
-  if (!items) return;
+  const clipboardData = e.clipboardData;
+  if (!clipboardData) return;
 
-  for (const item of items) {
-    if (item.type.startsWith("image/")) {
-      e.preventDefault();
+  const items = clipboardData.items;
+  if (items) {
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        e.preventDefault();
 
-      const blob = item.getAsFile();
-      const dataUrl = await blobToDataUrl(blob);
-      const match = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
-      if (!match) continue;
-      const [, mime, base64Data] = match;
+        const blob = item.getAsFile();
+        const dataUrl = await blobToDataUrl(blob);
+        const match = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
+        if (!match) return;
+        const [, mime, base64Data] = match;
 
-      try {
-        const { invoke } = window.__TAURI__.core;
-        const path = await invoke("save_pasted_image", { dataBase64: base64Data, mime });
-        const tab = activeTab();
-        if (tab) {
-          pushUndoSnapshot(tab);
+        try {
+          const { invoke } = window.__TAURI__.core;
+          const path = await invoke("save_pasted_image", { dataBase64: base64Data, mime });
+          const tab = activeTab();
+          if (tab) {
+            pushUndoSnapshot(tab);
+          }
+          insertAtCursor(editor, `![](${path})\n`);
+          if (tab) {
+            tab.content = editor.value;
+            tab.dirty = true;
+          }
+          renderTabBar();
+          updateStatusBar();
+          render();
+        } catch (err) {
+          alert("Failed to save image: " + err);
         }
-        insertAtCursor(editor, `![](${path})\n`);
-        if (tab) {
-          tab.content = editor.value;
-          tab.dirty = true;
-        }
-        renderTabBar();
-        updateStatusBar();
-        render();
-      } catch (err) {
-        alert("Failed to save image: " + err);
+        // 1回の貼り付けで複数画像が来た場合は、今回は先頭の1枚のみ対応
+        return;
       }
-      break; // 1回の貼り付けで複数画像が来た場合は、今回は先頭の1枚のみ対応
     }
   }
+
+  // 画像で無ければ、表形式のデータ(Excel・Webページ等からのコピー)か調べる
+  const html = clipboardData.getData("text/html");
+  let markdownTable = null;
+
+  if (html && /<table/i.test(html)) {
+    markdownTable = htmlToMarkdownTable(html);
+  }
+  if (!markdownTable) {
+    const text = clipboardData.getData("text/plain");
+    if (text) {
+      markdownTable = tsvToMarkdownTable(text);
+    }
+  }
+
+  if (markdownTable) {
+    e.preventDefault();
+    insertMarkdownTable(markdownTable);
+  }
+  // 表でもなければ、何もしない(通常のテキスト貼り付けに任せる)
 });
 
 // ------------------------------------------------------------
