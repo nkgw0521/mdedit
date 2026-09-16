@@ -104,6 +104,65 @@ fn unique_filename(ext: &str) -> String {
     format!("paste-{}-{}.{}", now.as_secs(), now.subsec_nanos(), ext)
 }
 
+// Markdownのリンク先(括弧の中)として安全な形にエンコードする。
+//
+// CommonMarkの仕様では、リンク先にASCIIスペースを含めることができない
+// (<>で囲んでも不可)。そのため、ファイル名やフォルダ名にスペースが
+// 含まれていると画像リンクとして認識されず、表示されなくなる。
+// これを避けるため、スペースなどを %20 形式にエンコードしておく。
+// 参考(1次情報): https://spec.commonmark.org/0.30/#link-destination
+//              https://github.com/commonmark/commonmark-spec/commit/2136f824b739c9525d25a6850f0bede1cd7d964b
+//
+// 日本語などの非ASCII文字はそのまま残す(markdown-it側が表示時に
+// 自動でエンコードし、こちらのJS側でデコードして解決しているため)。
+fn encode_md_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for ch in path.chars() {
+        match ch {
+            // '%' は最初に処理しないと二重エンコードの解釈が壊れる
+            '%' => out.push_str("%25"),
+            ' ' => out.push_str("%20"),
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            '"' => out.push_str("%22"),
+            '\t' => out.push_str("%09"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+// encode_md_path の逆変換。本文中のリンクを実際のファイルパスと
+// 比較するときに使う。
+fn decode_md_path(s: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 // Markdown本文中の "![alt](~/.mdedit/images/....)" 形式のリンクを見つけて、
 // 実ファイルを保存先と同じ場所の "<ファイル名>.assets/" フォルダへ移し、
 // リンクを相対パスに書き換える。
@@ -136,7 +195,23 @@ fn migrate_pasted_images(
         let alt = &caps[1];
         let url = &caps[2];
 
-        if io_error.is_some() || !url.starts_with(&staging_prefix) {
+        if io_error.is_some() {
+            return caps[0].to_string();
+        }
+
+        // 本文中のリンクはエンコードされている場合があるので、
+        // 実ファイルのパスと比較する前にデコードしておく。
+        let decoded_url = decode_md_path(url);
+
+        if !decoded_url.starts_with(&staging_prefix) {
+            // 一時フォルダ由来ではないリンク(既に移行済みの相対パスなど)。
+            // ただしスペースを含んでいるとMarkdownのリンクとして認識されない
+            // ため、その場合だけエンコードし直して修復する。
+            // (http(s)やdata:のリンクは対象外)
+            if !decoded_url.starts_with("http") && !decoded_url.starts_with("data:") && url.contains(' ')
+            {
+                return format!("![{}]({})", alt, encode_md_path(&decoded_url));
+            }
             return caps[0].to_string();
         }
 
@@ -148,7 +223,7 @@ fn migrate_pasted_images(
             created_assets_dir = true;
         }
 
-        let src_path = PathBuf::from(url);
+        let src_path = PathBuf::from(&decoded_url);
         let filename = match src_path.file_name() {
             Some(f) => f.to_owned(),
             None => return caps[0].to_string(),
@@ -164,11 +239,13 @@ fn migrate_pasted_images(
             let _ = fs::remove_file(&src_path);
         }
 
+        // ファイル名やフォルダ名にスペースが含まれていてもリンクが
+        // 壊れないよう、エンコードしてから書き出す。
         format!(
             "![{}]({}/{})",
             alt,
-            assets_dir_name,
-            filename.to_string_lossy()
+            encode_md_path(&assets_dir_name),
+            encode_md_path(&filename.to_string_lossy())
         )
     });
 
@@ -203,7 +280,12 @@ fn save_pasted_image(app: tauri::AppHandle, data_base64: String, mime: String) -
     let file_path = images_dir.join(&filename);
     fs::write(&file_path, &bytes).map_err(|e| e.to_string())?;
 
-    Ok(file_path.to_string_lossy().replace('\\', "/"))
+    // ここで返したパスはそのままMarkdownのリンクとして本文に挿入されるため、
+    // ホームフォルダ名などにスペースが含まれていてもリンクが壊れないよう
+    // エンコードしておく。
+    Ok(encode_md_path(
+        &file_path.to_string_lossy().replace('\\', "/"),
+    ))
 }
 
 // ファイルを開くダイアログを出し、選ばれたファイルを読み込む
