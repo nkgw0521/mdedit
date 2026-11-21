@@ -476,6 +476,10 @@ fn main() {
                 .id("save")
                 .accelerator("CmdOrCtrl+S")
                 .build(app)?;
+            let refresh_item = MenuItemBuilder::new("Refresh")
+                .id("refresh")
+                .accelerator("F5")
+                .build(app)?;
             let save_as_item = MenuItemBuilder::new("Save As...")
                 .id("save_as")
                 .accelerator("CmdOrCtrl+Shift+S")
@@ -513,6 +517,7 @@ fn main() {
                 .item(&open_item)
                 .separator()
                 .item(&save_item)
+                .item(&refresh_item)
                 .item(&save_as_item)
                 .separator()
                 .item(&export_html_item)
@@ -551,6 +556,9 @@ fn main() {
                 }
                 "save" => {
                     let _ = app_handle.emit("menu-save", ());
+                }
+                "refresh" => {
+                    let _ = app_handle.emit("menu-refresh", ());
                 }
                 "save_as" => {
                     let _ = app_handle.emit("menu-save-as", ());

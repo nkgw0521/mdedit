@@ -103,6 +103,30 @@ md.renderer.rules.image = (tokens, idx, options, env, self) => {
   return defaultImageRenderer(tokens, idx, options, env, self);
 };
 
+// ローカルファイルへの Markdown リンクは WebView のページ遷移にせず、
+// 後段のクリック処理でエディタの新しいタブとして開く。
+const defaultLinkOpenRenderer = md.renderer.rules.link_open ||
+  ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options));
+md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+  const token = tokens[idx];
+  const hrefIdx = token.attrIndex("href");
+  if (hrefIdx >= 0) {
+    const href = token.attrs[hrefIdx][1];
+    if (!/^(?:[a-z][a-z0-9+.-]*:|#|\/\/)/i.test(href)) {
+      const filePath = href.split(/[?#]/, 1)[0];
+      if (filePath) {
+        token.attrPush(["data-md-path", filePath]);
+        token.attrs[hrefIdx][1] = "#";
+      }
+    } else if (/^file:/i.test(href)) {
+      const filePath = href.split(/[?#]/, 1)[0];
+      token.attrPush(["data-md-path", filePath]);
+      token.attrs[hrefIdx][1] = "#";
+    }
+  }
+  return defaultLinkOpenRenderer(tokens, idx, options, env, self);
+};
+
 function resolveImageSrc(src) {
   if (/^(https?:|data:)/i.test(src)) {
     return src;
@@ -148,6 +172,14 @@ const tabBar = document.getElementById("tab-bar");
 const paneEditor = document.getElementById("pane-editor");
 const splitDivider = document.getElementById("split-divider");
 const splitContainer = document.querySelector(".split-container");
+
+preview.addEventListener("click", (event) => {
+  const anchor = event.target.closest("a[data-md-path]");
+  if (!anchor) return;
+  event.preventDefault();
+  const path = resolveLinkedFilePath(anchor.dataset.mdPath);
+  if (path) openFilesFromPaths([path]);
+});
 
 // ---------------------------------------------------------------
 // 中央の分割線をドラッグして、編集/プレビューの幅を変えられるようにする
@@ -477,6 +509,47 @@ async function doSave() {
   } catch (err) {
     alert("Failed to save file: " + err);
   }
+}
+
+// ディスク上で変更された内容を現在のタブへ読み直す。
+async function doRefresh() {
+  const tab = activeTab();
+  if (!tab || !tab.path) return;
+  if (tab.dirty && !confirm("Discard unsaved changes and reload this file?")) return;
+  try {
+    tab.content = await window.__TAURI__.core.invoke("read_text_file", { path: tab.path });
+    tab.dirty = false;
+    await deleteDraftForTab(tab);
+    editor.value = tab.content;
+    renderTabBar();
+    updateStatusBar();
+    await render();
+  } catch (err) {
+    alert("Failed to refresh file: " + err);
+  }
+}
+
+function resolveLinkedFilePath(href) {
+  let decoded;
+  try { decoded = decodeURIComponent(href); } catch (_) { decoded = href; }
+  if (/^file:/i.test(decoded)) {
+    try { decoded = decodeURIComponent(new URL(decoded).pathname); } catch (_) { return null; }
+    if (/^\/[a-zA-Z]:\//.test(decoded)) decoded = decoded.slice(1);
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(decoded) || decoded.startsWith("//")) return null;
+  const tab = activeTab();
+  if (/^[a-zA-Z]:[\\/]/.test(decoded) || decoded.startsWith("\\\\") || decoded.startsWith("/")) {
+    return decoded.replace(/\\/g, "/");
+  }
+  if (!tab || !tab.path) return null;
+  const dir = tab.path.replace(/[\\/][^\\/]*$/, "");
+  const parts = (dir + "/" + decoded).replace(/\\/g, "/").split("/");
+  const resolved = [];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") resolved.pop(); else resolved.push(part);
+  }
+  return resolved.join("/");
 }
 
 async function doSaveAs() {
@@ -911,6 +984,7 @@ window.addEventListener("load", async () => {
   listen("menu-new", () => doNew());
   listen("menu-open", () => doOpen());
   listen("menu-save", () => doSave());
+  listen("menu-refresh", () => doRefresh());
   listen("menu-save-as", () => doSaveAs());
   listen("menu-export-html", () => doExportHtml());
   listen("menu-export-pdf", () => doExportPdf());
@@ -928,6 +1002,11 @@ window.addEventListener("load", async () => {
   // 呼び出す。
   // ---------------------------------------------------------------
   document.addEventListener("keydown", (e) => {
+    if (e.key === "F5") {
+      e.preventDefault();
+      doRefresh();
+      return;
+    }
     const mod = e.ctrlKey || e.metaKey;
     if (!mod) return;
     const key = e.key.toLowerCase();
